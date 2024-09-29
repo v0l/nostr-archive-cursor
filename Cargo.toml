@@ -1,0 +1,13 @@
+[package]
+name = "nostr_stat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.89"
+clap = { version = "4.5.18", features = ["derive"] }
+serde = { version = "1.0.210", features = ["derive"] }
+tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util"] }
+serde_json = "1.0.128"
+hex = "0.4.3"
+async-compression = { version = "0.4.12", features = ["tokio", "gzip", "zstd", "bzip2"] }
