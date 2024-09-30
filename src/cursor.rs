@@ -1,10 +1,12 @@
 use crate::event::NostrEvent;
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, ZstdDecoder};
+use async_stream::try_stream;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio_stream::Stream;
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct EventId([u8; 32]);
@@ -27,44 +29,52 @@ impl NostrCursor {
         }
     }
 
-    pub async fn walk<T>(&mut self, mut fx: T) -> Result<(), anyhow::Error>
-    where
-        T: FnMut(&NostrEvent),
+    pub fn walk(&mut self) -> impl Stream<Item=Result<NostrEvent, anyhow::Error>> + '_
     {
-        let mut dir_reader = tokio::fs::read_dir(&self.dir).await?;
-        while let Ok(Some(path)) = dir_reader.next_entry().await {
-            let path = path.path();
-            println!("Reading: {}", path.to_str().unwrap());
-            let file: Pin<Box<dyn AsyncRead>> = match path.extension() {
-                Some(ext) => {
-                    let buf_reader = BufReader::new(File::open(path.clone()).await?);
-                    match ext.to_str().unwrap() {
-                        "json" => Box::pin(buf_reader),
-                        "gz" => Box::pin(GzipDecoder::new(buf_reader)),
-                        "zstd" => Box::pin(ZstdDecoder::new(buf_reader)),
-                        "bz2" => Box::pin(BzDecoder::new(buf_reader)),
-                        _ => anyhow::bail!("Unknown extension")
-                    }
+        try_stream! {
+            let mut dir_reader = tokio::fs::read_dir(&self.dir).await?;
+            while let Ok(Some(path)) = dir_reader.next_entry().await {
+                if path.file_type().await?.is_dir() {
+                    continue;
                 }
-                None => anyhow::bail!("Could not determine archive format")
-            };
-            let mut file = BufReader::new(file);
-            let mut line = String::new();
-            while let Ok(size) = file.read_line(&mut line).await {
-                if size == 0 {
-                    break;
-                }
+                let path = path.path();
+                println!("Reading: {}", path.to_str().unwrap());
+                let file = self.open_file(path).await?;
 
-                if let Ok(event) = serde_json::from_str::<NostrEvent>(&line[..size]) {
-                    let ev_id = EventId(hex::decode(&event.id)?.as_slice().try_into()?);
-                    if self.ids.insert(ev_id) {
-                        fx(&event);
+                let mut file = BufReader::new(file);
+                let mut line = String::new();
+                while let Ok(size) = file.read_line(&mut line).await {
+                    if size == 0 {
+                        break;
                     }
+
+                    if let Ok(event) = serde_json::from_str::<NostrEvent>(&line[..size]) {
+                        let ev_id = EventId(hex::decode(&event.id)?.as_slice().try_into()?);
+                        if self.ids.insert(ev_id) {
+                            yield event
+                        }
+                    }
+                    line.clear();
                 }
-                line.clear();
             }
         }
+    }
 
-        Ok(())
+    async fn open_file(&self, path: PathBuf) -> Result<Pin<Box<dyn AsyncRead>>, anyhow::Error>
+    {
+        let f = BufReader::new(File::open(path.clone()).await?);
+        match path.extension() {
+            Some(ext) => {
+                match ext.to_str().unwrap() {
+                    "json" => Ok(Box::pin(f)),
+                    "jsonl" => Ok(Box::pin(f)),
+                    "gz" => Ok(Box::pin(GzipDecoder::new(f))),
+                    "zst" => Ok(Box::pin(ZstdDecoder::new(f))),
+                    "bz2" => Ok(Box::pin(BzDecoder::new(f))),
+                    _ => anyhow::bail!("Unknown extension")
+                }
+            }
+            None => anyhow::bail!("Could not determine archive format")
+        }
     }
 }
