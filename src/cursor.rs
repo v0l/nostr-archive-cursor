@@ -29,8 +29,7 @@ impl NostrCursor {
         }
     }
 
-    pub fn walk(&mut self) -> impl Stream<Item=Result<NostrEvent, anyhow::Error>> + '_
-    {
+    pub fn walk(&mut self) -> impl Stream<Item = Result<NostrEvent, anyhow::Error>> + '_ {
         try_stream! {
             let mut dir_reader = tokio::fs::read_dir(&self.dir).await?;
             while let Ok(Some(path)) = dir_reader.next_entry().await {
@@ -39,42 +38,63 @@ impl NostrCursor {
                 }
                 let path = path.path();
                 println!("Reading: {}", path.to_str().unwrap());
-                let file = self.open_file(path).await?;
+                if let Ok(file) = self.open_file(path).await {
+                    let mut file = BufReader::new(file);
+                    let mut line = Vec::new();
+                    let mut lines = 0u64;
+                    let mut duplicates = 0u64;
 
-                let mut file = BufReader::new(file);
-                let mut line = String::new();
-                while let Ok(size) = file.read_line(&mut line).await {
-                    if size == 0 {
-                        break;
-                    }
+                    loop {
+                        match file.read_until(10, &mut line).await {
+                            Ok(size) => {
+                                if size == 0 {
+                                    println!("EOF. lines={lines}, duplicates={duplicates}");
+                                    break;
+                                }
+                                lines += 1;
 
-                    if let Ok(event) = serde_json::from_str::<NostrEvent>(&line[..size]) {
-                        let ev_id = EventId(hex::decode(&event.id)?.as_slice().try_into()?);
-                        if self.ids.insert(ev_id) {
-                            yield event
+                                let line_json = &line[..size];
+                                match serde_json::from_slice::<NostrEvent>(line_json) {
+                                    Ok(event) => {
+                                        let ev_id = EventId(hex::decode(&event.id)?.as_slice().try_into()?);
+                                        if self.ids.insert(ev_id) {
+                                            yield event
+                                        } else {
+                                            duplicates += 1;
+                                        }
+                                    },
+                                    Err(e) => {
+                                        println!("Invalid json on {} {e}", String::from_utf8_lossy(line_json))
+                                    }
+                                }
+
+                                line.clear();
+                            }
+                        Err(e) => {
+                                println!("Error reading file: {}", e);
+                                break;
+                            }
                         }
                     }
-                    line.clear();
+                } else {
+                    println!("Could not open");
                 }
             }
         }
     }
 
-    async fn open_file(&self, path: PathBuf) -> Result<Pin<Box<dyn AsyncRead>>, anyhow::Error>
-    {
+    async fn open_file(&self, path: PathBuf) -> Result<Pin<Box<dyn AsyncRead>>, anyhow::Error> {
         let f = BufReader::new(File::open(path.clone()).await?);
         match path.extension() {
-            Some(ext) => {
-                match ext.to_str().unwrap() {
-                    "json" => Ok(Box::pin(f)),
-                    "jsonl" => Ok(Box::pin(f)),
-                    "gz" => Ok(Box::pin(GzipDecoder::new(f))),
-                    "zst" => Ok(Box::pin(ZstdDecoder::new(f))),
-                    "bz2" => Ok(Box::pin(BzDecoder::new(f))),
-                    _ => anyhow::bail!("Unknown extension")
-                }
-            }
-            None => anyhow::bail!("Could not determine archive format")
+            Some(ext) => match ext.to_str().unwrap() {
+                "json" => Ok(Box::pin(f)),
+                "jsonl" => Ok(Box::pin(f)),
+                "gz" => Ok(Box::pin(GzipDecoder::new(f))),
+                "zst" => Ok(Box::pin(ZstdDecoder::new(f))),
+                "bz2" => Ok(Box::pin(BzDecoder::new(f))),
+                _ => anyhow::bail!("Unknown extension"),
+            },
+            None => anyhow::bail!("Could not determine archive format"),
         }
     }
 }
