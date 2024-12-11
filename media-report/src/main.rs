@@ -1,13 +1,18 @@
 use async_compression::tokio::write::ZstdEncoder;
 use clap::{Parser, ValueEnum};
-use nostr_archive_utils::cursor::NostrCursor;
+use nostr_cursor::cursor::NostrCursor;
+use nostr_cursor::event::NostrEvent;
 use regex::Regex;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
+use log::{error, info};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{RwLock, Semaphore};
 use tokio_stream::StreamExt;
 use url::Url;
 
@@ -32,7 +37,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
 
     let dir: PathBuf = args.dir.parse()?;
-    println!("Reading data from: {}", dir.to_str().unwrap());
+    info!("Reading data from: {}", dir.to_str().unwrap());
     match args.operation {
         ArgsOperation::Combine => {
             combine(dir).await?;
@@ -78,34 +83,61 @@ async fn combine(dir: PathBuf) -> Result<(), anyhow::Error> {
 }
 
 async fn media_report(dir: PathBuf) -> Result<(), anyhow::Error> {
-    let mut report = MediaReport::default();
+    let report = Arc::new(RwLock::new(MediaReport::default()));
 
     let mut binding = NostrCursor::new(dir.clone());
     let mut cursor = Box::pin(binding.walk());
-    let mut link_heads: HashMap<Url, bool> = HashMap::new();
-    let media_regex = Regex::new(
-        r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9\(\)]{1,6}\b(?:[-a-zA-Z0-9\(\)!@:%_\+.~#?&\/\/=]*)",
-    )?;
-    let file_ext = Regex::new(r"\.[a-zA-Z]{1,5}$")?;
+    let link_heads = Arc::new(RwLock::new(HashMap::<Url, bool>::new()));
+    let sem = Arc::new(Semaphore::new(50));
     let mut notes = 0u64;
     while let Some(Ok(e)) = cursor.next().await {
         if e.kind != 1 {
             continue;
         }
 
+        let sem = sem.clone();
+        let permit = sem.acquire_owned().await?;
+        let links = link_heads.clone();
+        let report = report.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_note(e, report, links).await {
+                error!("Failed to process note: {}", e);
+            }
+            drop(permit);
+        });
         notes += 1;
-        for text in media_regex.find_iter(e.content.as_str()) {
-            let text = text.as_str().trim();
+    }
 
-            if let Ok(u) = Url::parse(text) {
-                let ext = match file_ext.find(u.path()) {
-                    Some(ext) => ext.as_str(),
-                    None => continue,
-                };
-                let host = match u.host_str() {
-                    Some(host) => host,
-                    None => continue,
-                };
+    info!("Processed {} notes, writing report!", notes);
+    let report = report.read().await;
+    let mut fout = File::create(dir.join("media_report.json")).await?;
+    fout.write_all(serde_json::to_vec(&report.deref())?.as_slice())
+        .await?;
+
+    Ok(())
+}
+
+async fn process_note(e: NostrEvent, report: Arc<RwLock<MediaReport>>, link_heads: Arc<RwLock<HashMap<Url, bool>>>) -> Result<(), anyhow::Error> {
+    let media_regex = Regex::new(
+        r"https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9\(\)]{1,6}\b(?:[-a-zA-Z0-9\(\)!@:%_\+.~#?&\/\/=]*)",
+    )?;
+    let file_ext = Regex::new(r"\.[a-zA-Z]{1,5}$")?;
+
+    for text in media_regex.find_iter(e.content.as_str()) {
+        let text = text.as_str().trim();
+
+        if let Ok(u) = Url::parse(text) {
+            let ext = match file_ext.find(u.path()) {
+                Some(ext) => ext.as_str(),
+                None => continue,
+            };
+            let host = match u.host_str() {
+                Some(host) => host,
+                None => continue,
+            };
+
+            {
+                let mut report = report.write().await;
                 inc_map(&mut report.hosts_count, host, 1);
                 inc_map(&mut report.extensions, ext, 1);
 
@@ -119,41 +151,58 @@ async fn media_report(dir: PathBuf) -> Result<(), anyhow::Error> {
                 } else {
                     inc_map(&mut report.hosts_no_imeta, host, 1);
                 }
+            }
 
-                if let Some(hr) = link_heads.get(&u) {
-                    if *hr {
-                        inc_map(&mut report.hosts_dead, host, 1);
-                    }
+            let hr = {
+                let links = link_heads.read().await;
+                if let Some(hr) = links.get(&u) {
+                    Some(*hr)
                 } else {
-                    print!("Testing link {text} = ");
-                    match ureq::head(text)
+                    None
+                }
+            };
+            if let Some(hr) = hr {
+                if hr {
+                    let mut report = report.write().await;
+                    inc_map(&mut report.hosts_dead, host, 1);
+                }
+            } else {
+                info!("Testing link: {text}");
+                let cli = reqwest::Client::new();
+                loop {
+                    let u = u.clone();
+                    match cli.head(text)
                         .timeout(Duration::from_secs(5))
-                        .call() {
+                        .send().await {
                         Ok(rsp) => {
-                            println!("{}", rsp.status());
-                            if rsp.status() > 300 {
+                            if rsp.status() == 429 {
+                                info!("Rate limited by {}, waiting", u.host().unwrap());
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                continue;
+                            }
+
+                            let mut report = report.write().await;
+                            let mut link_heads = link_heads.write().await;
+                            if rsp.status().as_u16() > 300 {
                                 inc_map(&mut report.hosts_dead, host, 1);
                                 link_heads.insert(u, true);
                             } else {
                                 link_heads.insert(u, false);
                             }
+                            break;
                         }
                         Err(_) => {
-                            println!("500");
+                            let mut report = report.write().await;
+                            let mut link_heads = link_heads.write().await;
                             inc_map(&mut report.hosts_dead, host, 1);
                             link_heads.insert(u, true);
+                            break;
                         }
                     }
                 }
             }
         }
     }
-
-    println!("Processed {notes} notes, writing report!");
-    let mut fout = File::create(dir.join("media_report.json")).await?;
-    fout.write_all(serde_json::to_vec(&report)?.as_slice())
-        .await?;
-
     Ok(())
 }
 

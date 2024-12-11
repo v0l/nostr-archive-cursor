@@ -1,6 +1,7 @@
 use crate::event::NostrEvent;
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, ZstdDecoder};
 use async_stream::try_stream;
+use log::{error, info};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -37,7 +38,7 @@ impl NostrCursor {
                     continue;
                 }
                 let path = path.path();
-                println!("Reading: {}", path.to_str().unwrap());
+                info!("Reading: {}", path.to_str().unwrap());
                 if let Ok(file) = self.open_file(path).await {
                     let mut file = BufReader::new(file);
                     let mut line = Vec::new();
@@ -48,7 +49,7 @@ impl NostrCursor {
                         match file.read_until(10, &mut line).await {
                             Ok(size) => {
                                 if size == 0 {
-                                    println!("EOF. lines={lines}, duplicates={duplicates}");
+                                    info!("EOF. lines={lines}, duplicates={duplicates}");
                                     break;
                                 }
                                 lines += 1;
@@ -64,20 +65,20 @@ impl NostrCursor {
                                         }
                                     },
                                     Err(e) => {
-                                        println!("Invalid json on {} {e}", String::from_utf8_lossy(line_json))
+                                        //warn!("Invalid json on {} {e}", String::from_utf8_lossy(line_json))
                                     }
                                 }
 
                                 line.clear();
                             }
                         Err(e) => {
-                                println!("Error reading file: {}", e);
+                                error!("Error reading file: {}", e);
                                 break;
                             }
                         }
                     }
                 } else {
-                    println!("Could not open");
+                    error!("Could not open");
                 }
             }
         }
