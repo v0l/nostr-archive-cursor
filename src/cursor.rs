@@ -1,7 +1,7 @@
 use crate::event::NostrEvent;
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, ZstdDecoder};
 use async_stream::try_stream;
-use log::{error, info};
+use log::{debug, error, info};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -65,7 +65,7 @@ impl NostrCursor {
                                         }
                                     },
                                     Err(e) => {
-                                        //warn!("Invalid json on {} {e}", String::from_utf8_lossy(line_json))
+                                        debug!("Invalid json on {} {}", String::from_utf8_lossy(line_json), e)
                                     }
                                 }
 

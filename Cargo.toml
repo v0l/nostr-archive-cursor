@@ -1,14 +1,18 @@
 [package]
-name = "nostr-cursor"
+name = "nostr-archive-cursor"
+description = "A utility library for iterating over JSON-L archives."
+repository = "https://github.com/v0l/nostr-archive-cursor.git"
+license = "MIT"
+readme = "README.md"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 log = "0.4.22"
 anyhow = "1.0.89"
 hex = "0.4.3"
 serde = { version = "1.0.210", features = ["derive"] }
-tokio = { version = "1.40.0", features = ["rt", "rt-multi-thread", "macros", "fs", "io-util"] }
+tokio = { version = "1.40.0", default-features = false, features = ["fs", "io-util"] }
 serde_json = "1.0.128"
 async-compression = { version = "0.4.12", features = ["tokio", "gzip", "zstd", "bzip2"] }
 tokio-stream = "0.1.16"
