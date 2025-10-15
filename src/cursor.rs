@@ -1,5 +1,5 @@
 use crate::event::NostrEvent;
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, ZstdDecoder};
 use async_stream::stream;
 use futures::stream::{Stream, StreamExt};
@@ -234,7 +234,7 @@ impl NostrCursor {
                 "json" => Ok(Box::pin(f)),
                 "jsonl" => Ok(Box::pin(f)),
                 "gz" => Ok(Box::pin(GzipDecoder::new(f))),
-                "zst" => Ok(Box::pin(ZstdDecoder::new(f))),
+                "zst" | "zstd" => Ok(Box::pin(ZstdDecoder::new(f))),
                 "bz2" => Ok(Box::pin(BzDecoder::new(f))),
                 _ => bail!("Unknown extension"),
             },
