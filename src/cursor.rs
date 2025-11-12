@@ -315,10 +315,12 @@ impl NostrCursor {
     ///     }
     /// }).await;
     /// ```
-    pub async fn walk_with<F, Fut>(self, callback: F)
+    pub async fn walk_with<F>(self, callback: F)
     where
-        F: Fn(NostrEventBorrowed<'_>) -> Fut + Send + Sync + Clone + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: for<'a> Fn(NostrEventBorrowed<'a>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+            + Send
+            + Sync
+            + Clone,
     {
         let dir = self.dir.clone();
         let parallelism = self.parallelism;
@@ -345,7 +347,8 @@ impl NostrCursor {
 
         // Use FuturesUnordered for dynamic work distribution
         // This ensures all threads stay busy by starting new tasks as soon as previous ones complete
-        let mut tasks: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> = FuturesUnordered::new();
+        let mut tasks: FuturesUnordered<Pin<Box<dyn Future<Output = ()> + Send>>> =
+            FuturesUnordered::new();
         let mut file_iter = files.into_iter();
 
         // Start initial batch of tasks up to parallelism limit
@@ -387,13 +390,14 @@ impl NostrCursor {
     }
 
     /// Reads a single file and invokes the async callback for each deduplicated event.
-    async fn read_file_with_callback<F, Fut>(
+    async fn read_file_with_callback<F>(
         path: PathBuf,
         callback: F,
         mut ids: Option<Arc<DashMap<EventId, ()>>>,
     ) where
-        F: Fn(NostrEventBorrowed<'_>) -> Fut + Send + Sync,
-        Fut: Future<Output = ()> + Send,
+        F: for<'a> Fn(NostrEventBorrowed<'a>) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>
+            + Send
+            + Sync,
     {
         match Self::open_file_static(path.clone()).await {
             Ok(f) => {
