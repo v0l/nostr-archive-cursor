@@ -213,7 +213,7 @@ impl FlatFileWriter {
 
     /// Spawn a task to compress a file
     async fn compress_file(file: PathBuf) -> Result<()> {
-        let out_path = file.with_extension("jsonl.zstd");
+        let out_path = file.with_extension("jsonl.zst");
         let mut in_file = File::open(file.clone()).await?;
         {
             let out_file = File::create(out_path.clone()).await?;
