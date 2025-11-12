@@ -6,4 +6,4 @@ mod event;
 pub use cursor::NostrCursor;
 #[cfg(feature = "db")]
 pub use database::*;
-pub use event::NostrEvent;
+pub use event::{NostrEvent, NostrEventBorrowed};

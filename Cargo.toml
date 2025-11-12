@@ -4,7 +4,7 @@ description = "A utility library for iterating over JSON-L archives."
 repository = "https://github.com/v0l/nostr-archive-cursor.git"
 license = "MIT"
 readme = "README.md"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 [features]
@@ -34,4 +34,8 @@ rand = "0.9.2"
 
 [[bench]]
 name = "walk_bench"
+harness = false
+
+[[bench]]
+name = "json_parser_bench"
 harness = false

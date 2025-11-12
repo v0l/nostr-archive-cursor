@@ -1,4 +1,4 @@
-use crate::event::NostrEvent;
+use crate::event::{NostrEvent, NostrEventBorrowed};
 use anyhow::{Result, bail};
 use async_compression::tokio::bufread::{BzDecoder, GzipDecoder, ZstdDecoder};
 use async_stream::stream;
@@ -276,21 +276,23 @@ impl NostrCursor {
     ///
     /// # Arguments
     ///
-    /// * `callback` - An async function called for each event. Must be `Fn` (not `FnMut`) to allow
-    ///   concurrent calls from multiple file readers. Use interior mutability (e.g., `Mutex`)
-    ///   if you need to mutate shared state.
+    /// * `callback` - An async function called for each event with zero-copy borrowed data.
+    ///   Must be `Fn` (not `FnMut`) to allow concurrent calls from multiple file readers.
+    ///   Use interior mutability (e.g., `Mutex`) if you need to mutate shared state.
     ///
     /// # Behavior
     ///
     /// - Reads up to `parallelism` files concurrently
     /// - Automatically deduplicates events based on event ID
     /// - Callback is invoked in parallel from multiple file readers
+    /// - Events are passed as borrowed data (zero-copy) - convert with `.to_owned()` if needed
     /// - Waits for all files to complete before returning
     ///
     /// # Performance
     ///
     /// This approach enables true parallel processing since each file reader can invoke
     /// the callback independently, unlike `walk()` which returns a single sequential stream.
+    /// Events are parsed with zero-copy deserialization for better performance.
     ///
     /// # Example
     ///
@@ -306,15 +308,16 @@ impl NostrCursor {
     /// cursor.walk_with(move |event| {
     ///     let counter = counter_clone.clone();
     ///     async move {
-    ///         // Process event in parallel (async)
+    ///         // Process borrowed event in parallel (async)
     ///         let mut count = counter.lock().unwrap();
     ///         *count += 1;
+    ///         // Convert to owned if needed: let owned = event.to_owned();
     ///     }
     /// }).await;
     /// ```
     pub async fn walk_with<F, Fut>(self, callback: F)
     where
-        F: Fn(NostrEvent) -> Fut + Send + Sync + Clone + 'static,
+        F: Fn(NostrEventBorrowed<'_>) -> Fut + Send + Sync + Clone + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         let dir = self.dir.clone();
@@ -389,8 +392,8 @@ impl NostrCursor {
         callback: F,
         mut ids: Option<Arc<DashMap<EventId, ()>>>,
     ) where
-        F: Fn(NostrEvent) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = ()> + Send,
+        F: Fn(NostrEventBorrowed<'_>) -> Fut + Send + Sync,
+        Fut: Future<Output = ()> + Send,
     {
         match Self::open_file_static(path.clone()).await {
             Ok(f) => {
@@ -409,29 +412,32 @@ impl NostrCursor {
                             lines += 1;
 
                             let line_json = &line[..size];
-                            match serde_json::from_slice::<NostrEvent>(line_json) {
+                            match serde_json::from_slice::<NostrEventBorrowed>(line_json) {
                                 Ok(event) => {
-                                    let ev_id = match hex::decode(&event.id) {
-                                        Ok(bytes) => match bytes.as_slice().try_into() {
-                                            Ok(array) => EventId(array),
+                                    // Only decode ID if deduplication is enabled
+                                    if let Some(ids_map) = ids.as_mut() {
+                                        let ev_id = match hex::decode(event.id) {
+                                            Ok(bytes) => match bytes.as_slice().try_into() {
+                                                Ok(array) => EventId(array),
+                                                Err(_) => {
+                                                    line.clear();
+                                                    continue;
+                                                }
+                                            },
                                             Err(_) => {
                                                 line.clear();
                                                 continue;
                                             }
-                                        },
-                                        Err(_) => {
-                                            line.clear();
-                                            continue;
-                                        }
-                                    };
+                                        };
 
-                                    // Check and insert into shared deduplication set (lock-free)
-                                    // insert() returns None if the key was not present
-                                    if ids
-                                        .as_mut()
-                                        .map(|i| i.insert(ev_id, ()).is_none())
-                                        .unwrap_or(true)
-                                    {
+                                        // Check and insert into shared deduplication set (lock-free)
+                                        // insert() returns None if the key was not present
+                                        if ids_map.insert(ev_id, ()).is_none() {
+                                            events += 1;
+                                            callback(event).await;
+                                        }
+                                    } else {
+                                        // No deduplication - process directly
                                         events += 1;
                                         callback(event).await;
                                     }

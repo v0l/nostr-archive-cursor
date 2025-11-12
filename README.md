@@ -11,6 +11,7 @@ A memory-efficient streaming processor for Nostr event archives that supports:
 ## Features
 
 - **Memory Efficient**: Events are streamed one at a time, not buffered in memory
+- **Zero-Copy Parsing**: `walk_with()` uses borrowed data with no string allocations during parsing
 - **Parallel Processing**: Read multiple files concurrently with configurable parallelism
 - **Automatic Deduplication**: Filters duplicate events based on event ID
 - **Compression Support**: Handles gzip, zstandard, and bzip2 compressed files
@@ -43,7 +44,7 @@ while let Some(event) = stream.next().await {
 
 ### Callback-based Parallel Processing
 
-For true parallel event processing, use `walk_with` which invokes a callback from multiple file readers concurrently:
+For true parallel event processing, use `walk_with` which invokes a callback from multiple file readers concurrently. Events are parsed with **zero-copy deserialization** for maximum performance:
 
 ```rust
 use std::sync::{Arc, Mutex};
@@ -58,11 +59,17 @@ cursor.walk_with(move |event| {
     let counter = counter_clone.clone();
     async move {
         // This async callback is invoked in parallel by multiple file readers
+        // Event is borrowed (zero-copy) - no string allocations during parsing
+
         // Use Arc/Mutex for shared state
         let mut count = counter.lock().unwrap();
         *count += 1;
 
-        // Process event here (can use .await for async operations)
+        // Access borrowed fields directly (zero-copy)
+        println!("Event ID: {}", event.id);
+
+        // Convert to owned if you need to store the event
+        // let owned = event.to_owned();
     }
 }).await;
 
@@ -74,7 +81,8 @@ println!("Processed {} events", *counter.lock().unwrap());
 - **Parallelism**: Set to 2-8 for optimal performance on most systems
 - **Memory**: Each parallel file reader uses one buffer (~8KB)
 - **Deduplication**: Event IDs are stored in a HashSet (32 bytes per event)
-- **Stream vs Callback**: Use `walk()` for sequential processing, use `walk_with()` for parallel callback-based processing
+- **Zero-Copy**: `walk_with()` uses borrowed strings during parsing - no allocations until you call `.to_owned()`
+- **Stream vs Callback**: Use `walk()` for sequential processing, `walk_with()` for parallel callback-based zero-copy processing
 
 ## Supported File Formats
 
