@@ -1,6 +1,8 @@
+use crate::NostrCursor;
 use anyhow::{Result, anyhow};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
+use futures::StreamExt;
 use log::{debug, error, info, warn};
 use nostr_sdk::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Events, NostrDatabase,
@@ -130,6 +132,30 @@ impl JsonFilesDatabase {
 
     pub fn count_keys(&self) -> u64 {
         self.item_count.load(Ordering::SeqCst) as u64
+    }
+
+    /// Rebuilt event id index
+    pub async fn rebuild_index(&mut self) -> Result<()> {
+        self.database.clear()?;
+
+        let cur = NostrCursor::new(self.out_dir.clone())
+            .with_dedupe(false) //skip dedupe
+            .walk();
+
+        let mut cur = Box::pin(cur);
+        while let Some(event) = cur.next().await {
+            if let Err(e) = self
+                .database
+                .insert(hex::decode(&event.id)?, &event.created_at.to_le_bytes())
+            {
+                warn!(
+                    "Failed to insert event into index {} {}",
+                    serde_json::to_string(&event)?,
+                    e
+                );
+            }
+        }
+        Ok(())
     }
 }
 
