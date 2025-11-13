@@ -2,8 +2,7 @@ use crate::NostrCursor;
 use anyhow::{Result, anyhow};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
-use futures::StreamExt;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use nostr_sdk::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Events, NostrDatabase,
     RejectedReason, SaveEventStatus,
@@ -53,7 +52,7 @@ impl JsonFilesDatabase {
         let db = sled::open(dir.join("index"))?;
         Ok(Self {
             out_dir: dir.clone(),
-            item_count: Arc::new(AtomicUsize::new(db.len())),
+            item_count: Arc::new(AtomicUsize::new(0)),
             database: db,
             file: Arc::new(Mutex::new(FlatFileWriter {
                 dir,
@@ -61,10 +60,6 @@ impl JsonFilesDatabase {
                 current_handle: None,
             })),
         })
-    }
-
-    pub async fn write_event(&self, ev: &Event) -> Result<()> {
-        self.file.lock().await.write_event(ev).await
     }
 
     pub async fn list_files(&self) -> Result<Vec<ArchiveFile>> {
@@ -130,31 +125,50 @@ impl JsonFilesDatabase {
             .collect()
     }
 
+    /// Returns the number of items in the index database
+    ///
+    /// **WARNING:** Can take a very long time if your index is very large, this operation is O(n)
     pub fn count_keys(&self) -> u64 {
-        self.item_count.load(Ordering::SeqCst) as u64
+        let ret = self.item_count.load(Ordering::SeqCst);
+        if ret == 0 {
+            trace!("Internal count was 0, using index db count (WARNING! O(n))");
+            let db_len = self.database.len();
+            self.item_count.store(db_len, Ordering::SeqCst);
+            db_len as u64
+        } else {
+            ret as u64
+        }
+    }
+
+    /// Is the index empty
+    pub fn is_index_empty(&self) -> bool {
+        self.database.is_empty()
     }
 
     /// Rebuilt event id index
     pub async fn rebuild_index(&mut self) -> Result<()> {
         self.database.clear()?;
 
-        let cur = NostrCursor::new(self.out_dir.clone())
-            .with_dedupe(false) //skip dedupe
-            .walk();
+        let db = self.database.clone();
+        NostrCursor::new(self.out_dir.clone())
+            .with_parallelism(4)
+            .with_dedupe(false)
+            .walk_with(move |event| {
+                let db = db.clone();
+                Box::pin(async move {
+                    if let Ok(id) = hex::decode(&event.id)
+                        && let Err(e) = db.insert(id, &event.created_at.to_le_bytes())
+                    {
+                        warn!(
+                            "Failed to insert event into index {} {}",
+                            serde_json::to_string(&event).unwrap_or_default(),
+                            e
+                        );
+                    }
+                })
+            })
+            .await;
 
-        let mut cur = Box::pin(cur);
-        while let Some(event) = cur.next().await {
-            if let Err(e) = self
-                .database
-                .insert(hex::decode(&event.id)?, &event.created_at.to_le_bytes())
-            {
-                warn!(
-                    "Failed to insert event into index {} {}",
-                    serde_json::to_string(&event)?,
-                    e
-                );
-            }
-        }
         Ok(())
     }
 }
@@ -175,7 +189,8 @@ impl NostrDatabase for JsonFilesDatabase {
                         .insert(event.id, &event.created_at.as_secs().to_le_bytes())
                         .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
 
-                    self.write_event(event).await.map_err(|e| {
+                    let mut fl = self.file.lock().await;
+                    fl.write_event(event).await.map_err(|e| {
                         DatabaseError::Backend(Box::new(Error::new(ErrorKind::Other, e)))
                     })?;
                     self.item_count.fetch_add(1, Ordering::SeqCst);
