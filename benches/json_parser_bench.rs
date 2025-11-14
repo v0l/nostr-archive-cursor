@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use nostr_archive_cursor::event::{NostrEvent, NostrEventBorrowed};
 
 const SIMPLE_EVENT: &str = r#"{"id":"abc123def456","pubkey":"def456abc123","created_at":1234567890,"kind":1,"tags":[],"content":"Hello world","sig":"xyz789"}"#;
@@ -38,7 +38,8 @@ fn benchmark_event_with_tags(c: &mut Criterion) {
 
     group.bench_function("serde_borrowed", |b| {
         b.iter(|| {
-            let _event: NostrEventBorrowed = serde_json::from_str(black_box(EVENT_WITH_TAGS)).unwrap();
+            let _event: NostrEventBorrowed =
+                serde_json::from_str(black_box(EVENT_WITH_TAGS)).unwrap();
         });
     });
 
@@ -74,7 +75,8 @@ fn benchmark_large_content(c: &mut Criterion) {
 
     group.bench_function("serde_borrowed", |b| {
         b.iter(|| {
-            let _event: NostrEventBorrowed = serde_json::from_str(black_box(LARGE_CONTENT_EVENT)).unwrap();
+            let _event: NostrEventBorrowed =
+                serde_json::from_str(black_box(LARGE_CONTENT_EVENT)).unwrap();
         });
     });
 
@@ -91,21 +93,30 @@ fn benchmark_batch_parsing(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("batch_parsing");
 
-    group.bench_with_input(BenchmarkId::new("serde_json", events.len()), &events, |b, events| {
-        b.iter(|| {
-            for event_json in events {
-                let _event: NostrEvent = serde_json::from_str(black_box(event_json)).unwrap();
-            }
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("serde_json", events.len()),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                for event_json in events {
+                    let _event: NostrEvent = serde_json::from_str(black_box(event_json)).unwrap();
+                }
+            });
+        },
+    );
 
-    group.bench_with_input(BenchmarkId::new("serde_borrowed", events.len()), &events, |b, events| {
-        b.iter(|| {
-            for event_json in events {
-                let _event: NostrEventBorrowed = serde_json::from_str(black_box(event_json)).unwrap();
-            }
-        });
-    });
+    group.bench_with_input(
+        BenchmarkId::new("serde_borrowed", events.len()),
+        &events,
+        |b, events| {
+            b.iter(|| {
+                for event_json in events {
+                    let _event: NostrEventBorrowed =
+                        serde_json::from_str(black_box(event_json)).unwrap();
+                }
+            });
+        },
+    );
 
     group.finish();
 }

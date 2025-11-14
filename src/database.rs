@@ -105,19 +105,23 @@ impl JsonFilesDatabase {
         }
     }
 
-    /// List key/value pairs from the index database (for sync)
-    pub fn list_ids(&self) -> Vec<(EventId, Timestamp)> {
+    /// List key/value pairs from the index database
+    pub fn list_ids(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
         self.database
             .iter()
-            .map_while(|x| {
+            .filter_map(|x| {
                 if let Ok((k, v)) = x {
                     let v_slice = v.iter().as_slice();
                     let timestamp = if v_slice.len() != 8 {
-                        Timestamp::from_secs(0)
+                        0
                     } else {
-                        Timestamp::from_secs(u64::from_le_bytes(v_slice.try_into().ok()?))
+                        u64::from_le_bytes(v_slice.try_into().ok()?)
                     };
-                    Some((EventId::from_slice(&k).ok()?, timestamp))
+                    if timestamp >= since && timestamp <= until {
+                        Some((EventId::from_slice(&k).ok()?, Timestamp::from(timestamp)))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }

@@ -1,9 +1,9 @@
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use nostr_archive_cursor::{NostrCursor, NostrEvent};
 use rand::Rng;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
@@ -28,9 +28,11 @@ async fn create_dummy_files(dir: &PathBuf, num_files: usize, events_per_file: us
                 id: event_id,
                 created_at: 1700000000,
                 kind: 1,
-                pubkey: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+                pubkey: "0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
                 sig: "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-                content: "This is a benchmark test event with some content to make it realistic".to_string(),
+                content: "This is a benchmark test event with some content to make it realistic"
+                    .to_string(),
                 tags: vec![
                     vec!["e".to_string(), "ref123".to_string()],
                     vec!["p".to_string(), "pubkey123".to_string()],
@@ -79,15 +81,16 @@ fn bench_walk_with(c: &mut Criterion) {
                             let counter = Arc::new(AtomicU64::new(0));
                             let counter_clone = counter.clone();
 
-                            let cursor = NostrCursor::new(temp_dir)
-                                .with_parallelism(parallelism);
+                            let cursor = NostrCursor::new(temp_dir).with_parallelism(parallelism);
 
-                            cursor.walk_with(move |_event| {
-                                let counter = counter_clone.clone();
-                                async move {
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
-                            }).await;
+                            cursor
+                                .walk_with(move |_event| {
+                                    let counter = counter_clone.clone();
+                                    async move {
+                                        counter.fetch_add(1, Ordering::Relaxed);
+                                    }
+                                })
+                                .await;
 
                             let total = counter.load(Ordering::Relaxed);
                             assert_eq!(total, (num_files * events_per_file) as u64);
