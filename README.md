@@ -40,6 +40,14 @@ let mut stream = cursor.walk();
 while let Some(event) = stream.next().await {
     // Process event
 }
+
+// Use all available CPU cores for parallel processing
+let cursor = NostrCursor::new("./backups".into())
+    .with_max_parallelism();
+
+// Disable deduplication if you're certain there are no duplicates
+let cursor = NostrCursor::new("./backups".into())
+    .with_dedupe(false);
 ```
 
 ### Callback-based Parallel Processing
@@ -76,13 +84,43 @@ cursor.walk_with(move |event| {
 println!("Processed {} events", *counter.lock().unwrap());
 ```
 
+### Chunked Parallel Processing
+
+For maximum performance, use `walk_with_chunked` which processes events in batches. This is significantly faster than processing one event at a time:
+
+```rust
+use std::sync::{Arc, Mutex};
+
+let cursor = NostrCursor::new("./backups".into())
+    .with_parallelism(4);
+
+let counter = Arc::new(Mutex::new(0));
+let counter_clone = counter.clone();
+
+cursor.walk_with_chunked(move |events| {
+    let counter = counter_clone.clone();
+    Box::pin(async move {
+        // Process batch of borrowed events in parallel
+        let mut count = counter.lock().unwrap();
+        *count += events.len();
+
+        // All events in the batch borrow from the same buffer
+        for event in events {
+            println!("Processing event: {}", event.id);
+        }
+    })
+}, 1000).await;
+
+println!("Processed {} events", *counter.lock().unwrap());
+```
+
 ## Performance Notes
 
-- **Parallelism**: Set to 2-8 for optimal performance on most systems
+- **Parallelism**: Set to 2-8 for optimal performance on most systems, or use `.with_max_parallelism()` to use all CPU cores
 - **Memory**: Each parallel file reader uses one buffer (~8KB)
-- **Deduplication**: Event IDs are stored in a HashSet (32 bytes per event)
-- **Zero-Copy**: `walk_with()` uses borrowed strings during parsing - no allocations until you call `.to_owned()`
-- **Stream vs Callback**: Use `walk()` for sequential processing, `walk_with()` for parallel callback-based zero-copy processing
+- **Deduplication**: Event IDs are stored in a concurrent HashMap (32 bytes per unique event). Disable with `.with_dedupe(false)` if not needed
+- **Zero-Copy**: `walk_with()` and `walk_with_chunked()` use borrowed strings during parsing - no allocations until you call `.to_owned()`
+- **Stream vs Callback**: Use `walk()` for sequential processing, `walk_with()` for parallel event-by-event processing, `walk_with_chunked()` for parallel batch processing (fastest)
 
 ## Supported File Formats
 
@@ -124,7 +162,7 @@ client.connect().await;
 
 // Events received from relays are saved to:
 // - ./archive/events_20250112.jsonl (current day)
-// - ./archive/events_20250111.jsonl.zstd (previous days, compressed)
+// - ./archive/events_20250111.jsonl.zst (previous days, compressed)
 // - ./archive/index/ (sled database for deduplication)
 ```
 
@@ -133,9 +171,6 @@ client.connect().await;
 ```rust
 // Create new database
 let db = JsonFilesDatabase::new(dir)?;
-
-// Manually write an event
-db.write_event(&event).await?;
 
 // List all archive files
 let files: Vec<ArchiveFile> = db.list_files().await?;
@@ -150,11 +185,19 @@ for file in files {
 // Get specific archive file
 let file = db.get_file("/events_20250112.jsonl")?;
 
-// List all event IDs in index (for sync)
-let ids: Vec<(EventId, Timestamp)> = db.list_ids();
+// List event IDs in index with time range filter (for sync)
+let since = 0; // Unix timestamp
+let until = u64::MAX; // Unix timestamp
+let ids: Vec<(EventId, Timestamp)> = db.list_ids(since, until);
 
 // Get total event count
 let count = db.count_keys();
+
+// Check if index is empty
+let is_empty = db.is_index_empty();
+
+// Rebuild the event ID index from archive files
+db.rebuild_index().await?;
 ```
 
 ### File Structure
@@ -162,8 +205,8 @@ let count = db.count_keys();
 ```
 archive/
 ├── index/              # sled database (event ID → timestamp)
-├── events_20250110.jsonl.zstd  # Compressed past files
-├── events_20250111.jsonl.zstd
+├── events_20250110.jsonl.zst  # Compressed past files
+├── events_20250111.jsonl.zst
 └── events_20250112.jsonl       # Current day (uncompressed)
 ```
 
