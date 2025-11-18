@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash)]
 struct EventId([u8; 32]);
@@ -306,21 +306,20 @@ impl NostrCursor {
             match Self::open_file_static(path.clone()).await {
                 Ok(f) => {
                     let mut file = BufReader::new(f);
-                    let mut line = Vec::new();
-                    let mut lines = 0u64;
+                    let mut buffer = Vec::new();
+                    let mut objects = 0u64;
                     let mut events = 0u64;
 
                     loop {
-                        match file.read_until(10, &mut line).await {
+                        match read_json_object(&mut file, &mut buffer).await {
                             Ok(size) => {
                                 if size == 0 {
-                                    info!("EOF. lines={lines}, events={events}");
+                                    info!("EOF. objects={objects}, events={events}");
                                     break;
                                 }
-                                lines += 1;
+                                objects += 1;
 
-                                let line_json = &line[..size];
-                                match serde_json::from_slice::<NostrEvent>(line_json) {
+                                match serde_json::from_slice::<NostrEvent>(&buffer) {
                                     Ok(event) => {
                                         events += 1;
                                         yield event;
@@ -328,13 +327,11 @@ impl NostrCursor {
                                     Err(e) => {
                                         debug!(
                                             "Invalid json on {} {}",
-                                            String::from_utf8_lossy(line_json),
+                                            String::from_utf8_lossy(&buffer),
                                             e
                                         )
                                     }
                                 }
-
-                                line.clear();
                             }
                             Err(e) => {
                                 error!("Error reading file: {}", e);
@@ -607,36 +604,29 @@ impl NostrCursor {
         match Self::open_file_static(path.clone()).await {
             Ok(f) => {
                 let mut file = BufReader::new(f);
-                let mut line = Vec::with_capacity(1024 * 1024 * 64);
-                let mut lines = 0u64;
+                let mut buffer = Vec::with_capacity(1024 * 1024 * 64);
+                let mut objects = 0u64;
                 let mut events = 0u64;
 
                 loop {
-                    match file.read_until(10, &mut line).await {
+                    match read_json_object(&mut file, &mut buffer).await {
                         Ok(size) => {
                             if size == 0 {
-                                info!("EOF. lines={lines}, events={events}");
+                                info!("EOF. objects={objects}, events={events}");
                                 break;
                             }
-                            lines += 1;
+                            objects += 1;
 
-                            let line_json = &line[..size];
-                            match serde_json::from_slice::<NostrEventBorrowed>(line_json) {
+                            match serde_json::from_slice::<NostrEventBorrowed>(&buffer) {
                                 Ok(event) => {
                                     // Only decode ID if deduplication is enabled
                                     if let Some(ids_map) = ids.as_mut() {
                                         let ev_id = match hex::decode(event.id.deref()) {
                                             Ok(bytes) => match bytes.as_slice().try_into() {
                                                 Ok(array) => EventId(array),
-                                                Err(_) => {
-                                                    line.clear();
-                                                    continue;
-                                                }
+                                                Err(_) => continue,
                                             },
-                                            Err(_) => {
-                                                line.clear();
-                                                continue;
-                                            }
+                                            Err(_) => continue,
                                         };
 
                                         // Check and insert into shared deduplication set (lock-free)
@@ -654,13 +644,11 @@ impl NostrCursor {
                                 Err(e) => {
                                     warn!(
                                         "Invalid json on {} {}",
-                                        String::from_utf8_lossy(line_json),
+                                        String::from_utf8_lossy(&buffer),
                                         e
                                     )
                                 }
                             }
-
-                            line.clear();
                         }
                         Err(e) => {
                             error!("Error reading file: {}", e);
