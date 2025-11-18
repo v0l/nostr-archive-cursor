@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NostrEvent {
@@ -13,18 +14,13 @@ pub struct NostrEvent {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NostrEventBorrowed<'a> {
-    #[serde(borrow)]
-    pub id: &'a str,
+    pub id: Cow<'a, str>,
     pub created_at: u64,
     pub kind: u32,
-    #[serde(borrow)]
-    pub pubkey: &'a str,
-    #[serde(borrow)]
-    pub sig: &'a str,
-    #[serde(borrow)]
-    pub content: &'a str,
-    #[serde(borrow)]
-    pub tags: Vec<Vec<&'a str>>,
+    pub pubkey: Cow<'a, str>,
+    pub sig: Cow<'a, str>,
+    pub content: Cow<'a, str>,
+    pub tags: Vec<Vec<Cow<'a, str>>>,
 }
 
 impl<'a> NostrEventBorrowed<'a> {
@@ -61,10 +57,6 @@ mod tests {
         assert_eq!(event.content, "Hello world");
         assert_eq!(event.sig, "xyz789");
         assert_eq!(event.tags.len(), 0);
-
-        // Verify zero-copy: slices point into the original string
-        assert!(json.as_ptr() <= event.id.as_ptr());
-        assert!(event.id.as_ptr() < unsafe { json.as_ptr().add(json.len()) });
     }
 
     #[test]

@@ -11,6 +11,7 @@ use nostr_sdk::{Event, EventId, Filter, JsonUtil, Timestamp};
 use std::fmt::{Debug, Formatter};
 use std::fs::create_dir_all;
 use std::io::{Error, ErrorKind};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -160,7 +161,7 @@ impl JsonFilesDatabase {
             .walk_with(move |event| {
                 let db = db.clone();
                 Box::pin(async move {
-                    if let Ok(id) = hex::decode(&event.id)
+                    if let Ok(id) = hex::decode(event.id.deref())
                         && let Err(e) = db.insert(id, &event.created_at.to_le_bytes())
                     {
                         warn!(
@@ -195,7 +196,7 @@ impl NostrDatabase for JsonFilesDatabase {
 
                     let mut fl = self.file.lock().await;
                     fl.write_event(event).await.map_err(|e| {
-                        DatabaseError::Backend(Box::new(Error::new(ErrorKind::Other, e)))
+                        DatabaseError::Backend(Box::new(Error::other(e)))
                     })?;
                     self.item_count.fetch_add(1, Ordering::SeqCst);
                     debug!("Saved event: {}", event.id);
