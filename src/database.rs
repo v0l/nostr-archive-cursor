@@ -10,7 +10,7 @@ use nostr_sdk::prelude::{
 use nostr_sdk::{Event, EventId, Filter, JsonUtil, Timestamp};
 use std::fmt::{Debug, Formatter};
 use std::fs::create_dir_all;
-use std::io::{Error, ErrorKind};
+use std::io::{Error};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,17 +71,18 @@ impl JsonFilesDatabase {
                 continue;
             }
 
+            let meta = entry.metadata().await?;
+            let created_date = meta.created()?.into();
             let parsed_date = if let Some(d) = FlatFileWriter::parse_timestamp(&entry.path()) {
                 d
             } else {
-                continue;
+                created_date
             };
 
-            let meta = entry.metadata().await?;
             files.push(ArchiveFile {
                 path: entry.path(),
                 size: meta.len(),
-                created: meta.created()?.into(),
+                created: created_date,
                 timestamp: parsed_date,
             });
         }
@@ -195,9 +196,9 @@ impl NostrDatabase for JsonFilesDatabase {
                         .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
 
                     let mut fl = self.file.lock().await;
-                    fl.write_event(event).await.map_err(|e| {
-                        DatabaseError::Backend(Box::new(Error::other(e)))
-                    })?;
+                    fl.write_event(event)
+                        .await
+                        .map_err(|e| DatabaseError::Backend(Box::new(Error::other(e))))?;
                     self.item_count.fetch_add(1, Ordering::SeqCst);
                     debug!("Saved event: {}", event.id);
                     Ok(SaveEventStatus::Success)

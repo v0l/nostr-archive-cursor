@@ -24,6 +24,7 @@ pub struct NostrEventBorrowed<'a> {
 }
 
 impl<'a> NostrEventBorrowed<'a> {
+    #[allow(dead_code)]
     fn to_owned(&self) -> NostrEvent {
         NostrEvent {
             id: self.id.to_string(),
