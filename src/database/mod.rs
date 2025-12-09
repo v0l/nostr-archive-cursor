@@ -13,7 +13,6 @@ use std::fs::create_dir_all;
 use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -136,14 +135,16 @@ impl JsonFilesDatabase {
     /// faster than the async version for CPU-bound workloads like JSON parsing.
     #[cfg(feature = "sync")]
     pub fn rebuild_index(&mut self) -> Result<()> {
+        #[cfg(feature = "db-rocksdb")]
         let last_print = Arc::new(AtomicU64::new(Timestamp::now().as_secs()));
-
+        #[cfg(feature = "db-rocksdb")]
         self.database.setup_for_reindex()?;
+        #[cfg(feature = "db-rocksdb")]
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         let db = self.database.clone();
         NostrCursor::new(self.out_dir.clone())
             .with_max_parallelism()
-            .with_dedupe(false)
             .walk_with_chunked_sync(
                 move |events| {
                     let mut batch = Vec::with_capacity(events.len());
@@ -162,9 +163,9 @@ impl JsonFilesDatabase {
                         warn!("Failed to apply index update: {}", e);
                     }
 
-                    let now = Timestamp::now().as_secs();
-                    if (now - last_print.load(Ordering::Relaxed)) > 10 {
-                        last_print.store(now, Ordering::Relaxed);
+                    #[cfg(feature = "db-rocksdb")]
+                    if (Timestamp::now().as_secs() - last_print.load(Ordering::Relaxed)) > 10 {
+                        last_print.store(Timestamp::now().as_secs(), Ordering::Relaxed);
                         db.print_memory_usage();
                     }
                 },
