@@ -4,12 +4,12 @@ use std::str::from_utf8;
 
 #[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash)]
-struct EventId([u8; 32]);
+pub struct EventId(pub [u8; 32]);
 
 /// Fast hex decoding of event IDs using faster-hex
 #[cfg(any(feature = "sync", feature = "async"))]
 #[inline]
-fn decode_event_id(hex_str: &str) -> Result<EventId, ()> {
+pub fn decode_event_id(hex_str: &str) -> Result<EventId, ()> {
     if hex_str.len() != 64 {
         return Err(());
     }
