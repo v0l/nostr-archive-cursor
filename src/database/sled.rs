@@ -68,9 +68,19 @@ impl SledIndex {
         self.database
             .insert(id, &timestamp.as_secs().to_le_bytes())
             .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
-        self.item_count.fetch_add(1, Ordering::SeqCst);
+        self.item_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    pub fn insert_raw(&self, id: &[u8], timestamp: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(id.len() == 32, "Id must be 32 bytes long");
+        self.database
+            .insert(id, timestamp.to_le_bytes())
+            .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+        self.item_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
 
     pub fn insert_batch(&self, items: Vec<(EventId, Timestamp)>) -> Result<()> {
         let mut batch = sled::Batch::default();
@@ -79,7 +89,7 @@ impl SledIndex {
             batch.insert(k.as_bytes(), &v.as_secs().to_le_bytes());
         }
         self.database.apply_batch(batch)?;
-        self.item_count.fetch_add(len, Ordering::SeqCst);
+        self.item_count.fetch_add(len, Ordering::Relaxed);
         Ok(())
     }
 

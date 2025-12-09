@@ -122,6 +122,16 @@ impl RocksDbIndex {
         Ok(())
     }
 
+    pub fn insert_raw(&self, id: &[u8], timestamp: u64) -> Result<()> {
+        anyhow::ensure!(id.len() == 32, "Id must be 32 bytes long");
+        let database = self.database.as_ref().expect("Database not open");
+        database
+            .put(id, timestamp.to_le_bytes())
+            .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+        self.item_count.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn insert_batch(&self, items: Vec<(EventId, Timestamp)>) -> Result<()> {
         let database = self.database.as_ref().expect("Database not open");
         let mut batch = rocksdb::WriteBatch::new();
