@@ -1,6 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use log::{debug, trace};
+use log::{debug, trace, warn};
 use nostr_sdk::prelude::DatabaseError;
 use nostr_sdk::{EventId, Timestamp};
 use rocksdb::{BlockBasedOptions, IteratorMode, Options};
@@ -143,7 +143,14 @@ impl RocksDbIndex {
 
     pub fn contains_key(&self, id: &EventId) -> Result<bool> {
         let database = self.database.as_ref().expect("Database not open");
-        Ok(database.key_may_exist(id.as_bytes()))
+        match database.get_pinned(id.as_bytes()) {
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(e) => {
+                warn!("Failed to check key exist: {:?}", e);
+                Ok(false)
+            }
+        }
     }
 
     pub fn print_memory_usage(&self) {
