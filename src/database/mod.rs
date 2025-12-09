@@ -1,5 +1,5 @@
 use crate::NostrCursor;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
 use log::{debug, error, info, warn};
@@ -55,8 +55,8 @@ pub struct ArchiveFile {
 }
 
 impl JsonFilesDatabase {
-    pub fn new(dir: PathBuf) -> Result<Self> {
-        create_dir_all(&dir)?;
+    pub fn new(dir: &Path) -> Result<Self> {
+        create_dir_all(dir)?;
         let db = IndexDb::open(&dir.join("index"))?;
         Ok(Self {
             out_dir: dir.clone(),

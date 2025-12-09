@@ -125,6 +125,7 @@ impl RocksDbIndex {
         database
             .put(id, &timestamp.as_secs().to_le_bytes())
             .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+        self.item_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -135,6 +136,7 @@ impl RocksDbIndex {
             batch.put(k.as_bytes(), &v.as_secs().to_le_bytes());
         }
         database.write(batch)?;
+        self.item_count.fetch_add(batch.len(), Ordering::Relaxed);
         Ok(())
     }
 
