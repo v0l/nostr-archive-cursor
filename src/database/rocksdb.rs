@@ -144,9 +144,9 @@ impl RocksDbIndex {
         Ok(())
     }
 
-    pub fn contains_key(&self, id: &EventId) -> Result<bool> {
+    pub fn contains_key(&self, id: impl AsRef<[u8]>) -> Result<bool> {
         let database = self.database.as_ref().expect("Database not open");
-        match database.get_pinned(id.as_bytes()) {
+        match database.get_pinned(id) {
             Ok(Some(_)) => Ok(true),
             Ok(None) => Ok(false),
             Err(e) => {
