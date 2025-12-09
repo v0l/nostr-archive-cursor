@@ -3,7 +3,7 @@ mod cursor;
 mod database;
 mod event;
 
-pub use cursor::NostrCursor;
+pub use cursor::*;
 #[cfg(any(feature = "db-sled", feature = "db-rocksdb"))]
 pub use database::*;
 pub use event::{NostrEvent, NostrEventBorrowed};
