@@ -1,6 +1,6 @@
 use anyhow::Result;
 use anyhow::anyhow;
-use log::{debug, trace, warn};
+use log::{debug, warn};
 use nostr_sdk::prelude::DatabaseError;
 use nostr_sdk::{EventId, Timestamp};
 use rocksdb::{BlockBasedOptions, IteratorMode, Options};
@@ -24,9 +24,10 @@ impl RocksDbIndex {
         opts.set_block_based_table_factory(&table_opts);
 
         let db = rocksdb::DB::open(&opts, path).map_err(|e| anyhow!(e))?;
+        let db_len = db.iterator(IteratorMode::Start).count();
         Ok(Self {
             database: Some(Arc::new(db)),
-            item_count: Arc::new(AtomicUsize::new(0)),
+            item_count: Arc::new(AtomicUsize::new(db_len)),
         })
     }
 
@@ -89,16 +90,8 @@ impl RocksDbIndex {
     ///
     /// **WARNING:** Can take a very long time if your index is very large, this operation is O(n)
     pub fn count_keys(&self) -> u64 {
-        let database = self.database.as_ref().expect("Database not open");
         let ret = self.item_count.load(Ordering::SeqCst);
-        if ret == 0 {
-            trace!("Internal count was 0, using index db count (WARNING! O(n))");
-            let db_len = database.iterator(IteratorMode::Start).count();
-            self.item_count.store(db_len, Ordering::SeqCst);
-            db_len as u64
-        } else {
-            ret as u64
-        }
+        ret as u64
     }
 
     /// Is the index empty

@@ -17,9 +17,10 @@ pub struct SledIndex {
 impl SledIndex {
     pub fn open(path: &Path) -> Result<Self> {
         let db = sled::open(path).map_err(|e| anyhow!(e))?;
+        let db_len = db.len();
         Ok(Self {
             database: db,
-            item_count: Arc::new(AtomicUsize::new(0)),
+            item_count: Arc::new(AtomicUsize::new(db_len)),
         })
     }
 
@@ -51,14 +52,7 @@ impl SledIndex {
     /// **WARNING:** Can take a very long time if your index is very large, this operation is O(n)
     pub fn count_keys(&self) -> u64 {
         let ret = self.item_count.load(Ordering::SeqCst);
-        if ret == 0 {
-            trace!("Internal count was 0, using index db count (WARNING! O(n))");
-            let db_len = self.database.len();
-            self.item_count.store(db_len, Ordering::SeqCst);
-            db_len as u64
-        } else {
-            ret as u64
-        }
+        ret as u64
     }
 
     /// Is the index empty
