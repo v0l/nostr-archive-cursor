@@ -8,9 +8,9 @@ version = "0.4.3"
 edition = "2024"
 
 [features]
-default = ["sync", "async", "db-rocksdb"]
-db-sled = ["dep:sled", "dep:nostr-sdk", "dep:chrono", "dep:async-compression"]
-db-rocksdb = ["dep:rocksdb", "dep:nostr-sdk", "dep:chrono", "dep:async-compression"]
+default = ["sync", "db-rocksdb"]
+db-sled = ["dep:sled", "dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio"]
+db-rocksdb = ["dep:rocksdb", "dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio"]
 async = ["dep:async-compression", "dep:futures", "dep:tokio"]
 stream = ["dep:async-stream"]
 sync = ["dep:flate2", "dep:zstd", "dep:bzip2"]
