@@ -20,7 +20,7 @@ async fn create_dummy_files(dir: &PathBuf, num_files: usize, events_per_file: us
         for _event_idx in 0..events_per_file {
             // Generate random event ID (64 hex chars = 32 bytes)
             // This ensures proper distribution across DashMap's shards
-            let random_bytes: [u8; 32] = rng.r#gen();
+            let random_bytes: [u8; 32] = rng.random();
             let event_id = hex::encode(random_bytes);
 
             // Create a dummy event with unique ID but same content
@@ -86,9 +86,9 @@ fn bench_walk_with(c: &mut Criterion) {
                             cursor
                                 .walk_with(move |_event| {
                                     let counter = counter_clone.clone();
-                                    async move {
+                                    Box::pin(async move {
                                         counter.fetch_add(1, Ordering::Relaxed);
-                                    }
+                                    })
                                 })
                                 .await;
 
@@ -108,5 +108,66 @@ fn bench_walk_with(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_walk_with);
+/// Benchmark walk_with_chunked with different chunk sizes
+fn bench_walk_with_chunked(c: &mut Criterion) {
+    let mut group = c.benchmark_group("walk_with_chunked");
+
+    let parallelism = 4;
+    let num_files = 8;
+    let events_per_file = 5_000;
+
+    // Create test files once at the start
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let temp_dir = std::env::temp_dir().join(format!("nostr_bench_chunked_{}", std::process::id()));
+
+    // Clean up any existing files and create new ones
+    runtime.block_on(async {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+        create_dummy_files(&temp_dir, num_files, events_per_file).await;
+    });
+
+    for chunk_size in [100, 1000, 10000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(chunk_size),
+            &chunk_size,
+            |b, &chunk_size| {
+                let temp_dir = temp_dir.clone();
+                b.to_async(tokio::runtime::Runtime::new().unwrap())
+                    .iter(move || {
+                        let temp_dir = temp_dir.clone();
+                        async move {
+                            let counter = Arc::new(AtomicU64::new(0));
+                            let counter_clone = counter.clone();
+
+                            let cursor = NostrCursor::new(temp_dir).with_dedupe(false).with_parallelism(parallelism);
+
+                            cursor
+                                .walk_with_chunked(
+                                    move |events| {
+                                        let counter = counter_clone.clone();
+                                        Box::pin(async move {
+                                            counter.fetch_add(events.len() as u64, Ordering::Relaxed);
+                                        })
+                                    },
+                                    chunk_size,
+                                )
+                                .await;
+
+                            let total = counter.load(Ordering::Relaxed);
+                            assert_eq!(total, (num_files * events_per_file) as u64);
+                        }
+                    });
+            },
+        );
+    }
+
+    group.finish();
+
+    // Cleanup test files after all benchmarks complete
+    runtime.block_on(async {
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    });
+}
+
+criterion_group!(benches, bench_walk_with, bench_walk_with_chunked);
 criterion_main!(benches);

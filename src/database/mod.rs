@@ -2,7 +2,7 @@ use crate::NostrCursor;
 use anyhow::{Result, anyhow};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
-use log::{debug, error, info, trace, warn};
+use log::{debug, error, info, warn};
 use nostr_sdk::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Events, NostrDatabase,
     RejectedReason, SaveEventStatus,
@@ -10,14 +10,23 @@ use nostr_sdk::prelude::{
 use nostr_sdk::{Event, EventId, Filter, JsonUtil, Timestamp};
 use std::fmt::{Debug, Formatter};
 use std::fs::create_dir_all;
-use std::io::{Error};
-use std::ops::Deref;
+use std::io::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
+
+#[cfg(feature = "db-sled")]
+mod sled;
+#[cfg(feature = "db-sled")]
+pub type IndexDb = sled::SledIndex;
+
+#[cfg(feature = "db-rocksdb")]
+mod rocksdb;
+#[cfg(feature = "db-rocksdb")]
+pub type IndexDb = rocksdb::RocksDbIndex;
 
 /// Flat JSON-L file database for nostr_sdk
 #[derive(Clone)]
@@ -25,11 +34,9 @@ pub struct JsonFilesDatabase {
     /// Directory where flat files are contained
     out_dir: PathBuf,
     /// Event id index database
-    database: sled::Db,
+    database: IndexDb,
     /// Current file being written to
     file: Arc<Mutex<FlatFileWriter>>,
-    /// Total number of events in the database
-    item_count: Arc<AtomicUsize>,
 }
 
 impl Debug for JsonFilesDatabase {
@@ -50,10 +57,9 @@ pub struct ArchiveFile {
 impl JsonFilesDatabase {
     pub fn new(dir: PathBuf) -> Result<Self> {
         create_dir_all(&dir)?;
-        let db = sled::open(dir.join("index"))?;
+        let db = IndexDb::open(&dir.join("index"))?;
         Ok(Self {
             out_dir: dir.clone(),
-            item_count: Arc::new(AtomicUsize::new(0)),
             database: db,
             file: Arc::new(Mutex::new(FlatFileWriter {
                 dir,
@@ -109,71 +115,61 @@ impl JsonFilesDatabase {
 
     /// List key/value pairs from the index database
     pub fn list_ids(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
-        self.database
-            .iter()
-            .filter_map(|x| {
-                if let Ok((k, v)) = x {
-                    let v_slice = v.iter().as_slice();
-                    let timestamp = if v_slice.len() != 8 {
-                        0
-                    } else {
-                        u64::from_le_bytes(v_slice.try_into().ok()?)
-                    };
-                    if timestamp >= since && timestamp <= until {
-                        Some((EventId::from_slice(&k).ok()?, Timestamp::from(timestamp)))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
+        self.database.list_ids(since, until)
     }
 
     /// Returns the number of items in the index database
     ///
     /// **WARNING:** Can take a very long time if your index is very large, this operation is O(n)
     pub fn count_keys(&self) -> u64 {
-        let ret = self.item_count.load(Ordering::SeqCst);
-        if ret == 0 {
-            trace!("Internal count was 0, using index db count (WARNING! O(n))");
-            let db_len = self.database.len();
-            self.item_count.store(db_len, Ordering::SeqCst);
-            db_len as u64
-        } else {
-            ret as u64
-        }
+        self.database.count_keys()
     }
 
     /// Is the index empty
     pub fn is_index_empty(&self) -> bool {
-        self.database.is_empty()
+        self.database.is_index_empty()
     }
 
-    /// Rebuilt event id index
-    pub async fn rebuild_index(&mut self) -> Result<()> {
-        self.database.clear()?;
+    /// Rebuilt event id index using parallel std::thread workers.
+    ///
+    /// This method uses OS threads for true CPU parallelism, which is significantly
+    /// faster than the async version for CPU-bound workloads like JSON parsing.
+    #[cfg(feature = "sync")]
+    pub fn rebuild_index(&mut self) -> Result<()> {
+        let last_print = Arc::new(AtomicU64::new(Timestamp::now().as_secs()));
+
+        self.database.setup_for_reindex()?;
 
         let db = self.database.clone();
         NostrCursor::new(self.out_dir.clone())
-            .with_parallelism(4)
+            .with_max_parallelism()
             .with_dedupe(false)
-            .walk_with(move |event| {
-                let db = db.clone();
-                Box::pin(async move {
-                    if let Ok(id) = hex::decode(event.id.deref())
-                        && let Err(e) = db.insert(id, &event.created_at.to_le_bytes())
-                    {
-                        warn!(
-                            "Failed to insert event into index {} {}",
-                            serde_json::to_string(&event).unwrap_or_default(),
-                            e
-                        );
+            .walk_with_chunked_sync(
+                move |events| {
+                    let mut batch = Vec::with_capacity(events.len());
+                    let mut id = [0u8; 32];
+                    for event in events {
+                        if event.id.len() == 64
+                            && faster_hex::hex_decode(event.id.as_bytes(), &mut id).is_ok()
+                        {
+                            batch.push((
+                                EventId::from_slice(&id).unwrap(),
+                                Timestamp::from_secs(event.created_at),
+                            ));
+                        }
                     }
-                })
-            })
-            .await;
+                    if let Err(e) = db.insert_batch(batch) {
+                        warn!("Failed to apply index update: {}", e);
+                    }
+
+                    let now = Timestamp::now().as_secs();
+                    if (now - last_print.load(Ordering::Relaxed)) > 10 {
+                        last_print.store(now, Ordering::Relaxed);
+                        db.print_memory_usage();
+                    }
+                },
+                1000,
+            );
 
         Ok(())
     }
@@ -189,17 +185,20 @@ impl NostrDatabase for JsonFilesDatabase {
         event: &'a Event,
     ) -> BoxedFuture<'a, Result<SaveEventStatus, DatabaseError>> {
         Box::pin(async move {
-            match self.check_id(&event.id).await? {
-                DatabaseEventStatus::NotExistent => {
+            match self
+                .database
+                .contains_key(&event.id)
+                .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?
+            {
+                false => {
                     self.database
-                        .insert(event.id, &event.created_at.as_secs().to_le_bytes())
-                        .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+                        .insert(event.id, event.created_at)
+                        .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?;
 
                     let mut fl = self.file.lock().await;
                     fl.write_event(event)
                         .await
                         .map_err(|e| DatabaseError::Backend(Box::new(Error::other(e))))?;
-                    self.item_count.fetch_add(1, Ordering::SeqCst);
                     debug!("Saved event: {}", event.id);
                     Ok(SaveEventStatus::Success)
                 }
@@ -216,7 +215,7 @@ impl NostrDatabase for JsonFilesDatabase {
             if self
                 .database
                 .contains_key(event_id)
-                .map_err(|e| DatabaseError::Backend(Box::new(e)))?
+                .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?
             {
                 Ok(DatabaseEventStatus::Saved)
             } else {

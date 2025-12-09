@@ -1,5 +1,5 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use nostr_archive_cursor::event::{NostrEvent, NostrEventBorrowed};
+use nostr_archive_cursor::{NostrEvent, NostrEventBorrowed};
 
 const SIMPLE_EVENT: &str = r#"{"id":"abc123def456","pubkey":"def456abc123","created_at":1234567890,"kind":1,"tags":[],"content":"Hello world","sig":"xyz789"}"#;
 

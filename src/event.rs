@@ -14,12 +14,17 @@ pub struct NostrEvent {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct NostrEventBorrowed<'a> {
+    #[serde(borrow)]
     pub id: Cow<'a, str>,
     pub created_at: u64,
     pub kind: u32,
+    #[serde(borrow)]
     pub pubkey: Cow<'a, str>,
+    #[serde(borrow)]
     pub sig: Cow<'a, str>,
+    #[serde(borrow)]
     pub content: Cow<'a, str>,
+    #[serde(borrow)]
     pub tags: Vec<Vec<Cow<'a, str>>>,
 }
 
