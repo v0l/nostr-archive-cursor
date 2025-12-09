@@ -135,8 +135,9 @@ impl RocksDbIndex {
         for (k, v) in items {
             batch.put(k.as_bytes(), &v.as_secs().to_le_bytes());
         }
+        let batch_size = batch.len();
         database.write(batch)?;
-        self.item_count.fetch_add(batch.len(), Ordering::Relaxed);
+        self.item_count.fetch_add(batch_size, Ordering::Relaxed);
         Ok(())
     }
 

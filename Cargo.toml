@@ -4,11 +4,11 @@ description = "A utility library for iterating over JSON-L archives."
 repository = "https://github.com/v0l/nostr-archive-cursor.git"
 license = "MIT"
 readme = "README.md"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 
 [features]
-default = ["sync", "async"]
+default = ["sync", "async", "db-rocksdb"]
 db-sled = ["dep:sled", "dep:nostr-sdk", "dep:chrono", "dep:async-compression"]
 db-rocksdb = ["dep:rocksdb", "dep:nostr-sdk", "dep:chrono", "dep:async-compression"]
 async = ["dep:async-compression", "dep:futures", "dep:tokio"]

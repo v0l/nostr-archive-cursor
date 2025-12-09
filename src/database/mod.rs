@@ -1,5 +1,5 @@
 use crate::NostrCursor;
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
 use log::{debug, error, info, warn};
@@ -59,10 +59,10 @@ impl JsonFilesDatabase {
         create_dir_all(dir)?;
         let db = IndexDb::open(&dir.join("index"))?;
         Ok(Self {
-            out_dir: dir.clone(),
+            out_dir: dir.to_path_buf(),
             database: db,
             file: Arc::new(Mutex::new(FlatFileWriter {
-                dir,
+                dir: dir.to_path_buf(),
                 current_date: Utc::now(),
                 current_handle: None,
             })),
