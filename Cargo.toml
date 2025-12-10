@@ -4,21 +4,21 @@ description = "A utility library for iterating over JSON-L archives."
 repository = "https://github.com/v0l/nostr-archive-cursor.git"
 license = "MIT"
 readme = "README.md"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 
 [features]
-default = ["sync", "db-rocksdb"]
-db-sled = ["dep:sled", "dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio"]
-db-rocksdb = ["dep:rocksdb", "dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio"]
+default = []
+db = ["dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio", "dep:zstd"]
+db-sled = ["dep:sled", "db"]
+db-rocksdb = ["dep:rocksdb", "db"]
 async = ["dep:async-compression", "dep:futures", "dep:tokio"]
 stream = ["dep:async-stream"]
-sync = ["dep:flate2", "dep:zstd", "dep:bzip2"]
+sync = ["dep:flate2", "dep:bzip2", "dep:zstd"]
 
 [dependencies]
 log = "0.4"
 anyhow = "1"
-hex = "0.4"
 faster-hex = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,26 +32,18 @@ futures = { version = "0.3", optional = true }
 
 # Sync compression for std::thread-based processing
 flate2 = { version = "1", optional = true }
-zstd = { version = "0.13", optional = true }
 bzip2 = { version = "0.6", optional = true }
 
+# Database deps
+zstd = { version = "0.13", optional = true }
 sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.24", optional = true, default-features = false, features = ["zstd"] }
 nostr-sdk = { version = "0.44", default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
 
+[[example]]
+name = "nostr"
+required-features = ["sync", "db-rocksdb"]
+
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
-criterion = { version = "0.8", features = ["async_tokio"] }
-rand = "0.9.2"
-
-[[bench]]
-name = "walk_bench"
-harness = false
-
-[[bench]]
-name = "json_parser_bench"
-harness = false
-
-[profile.bench]
-debug = true
+env_logger = "0.11"

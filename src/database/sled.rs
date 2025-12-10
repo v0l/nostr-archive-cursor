@@ -1,11 +1,12 @@
+#![cfg(feature = "db-sled")]
+use crate::IndexDb;
 use anyhow::Result;
 use anyhow::anyhow;
-use log::trace;
-use nostr_sdk::prelude::DatabaseError;
-use nostr_sdk::{EventId, Timestamp};
+use log::warn;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zstd::zstd_safe::WriteBuf;
 
 #[derive(Clone)]
 pub struct SledIndex {
@@ -15,7 +16,10 @@ pub struct SledIndex {
 }
 
 impl SledIndex {
-    pub fn open(path: &Path) -> Result<Self> {
+    pub fn open<P>(path: P) -> Result<Self>
+    where
+        P: AsRef<Path>,
+    {
         let db = sled::open(path).map_err(|e| anyhow!(e))?;
         let db_len = db.len();
         Ok(Self {
@@ -23,20 +27,23 @@ impl SledIndex {
             item_count: Arc::new(AtomicUsize::new(db_len)),
         })
     }
+}
 
-    pub fn list_ids(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
+impl IndexDb for SledIndex {
+    fn list_ids<'a>(&'a self, min: &[u8; 8], max: &[u8; 8]) -> Vec<(&'a [u8; 32], &'a [u8; 8])> {
         self.database
             .iter()
             .filter_map(|x| {
                 if let Ok((k, v)) = x {
-                    let v_slice = v.iter().as_slice();
-                    let timestamp = if v_slice.len() != 8 {
-                        0
-                    } else {
-                        u64::from_le_bytes(v_slice.try_into().ok()?)
-                    };
-                    if timestamp >= since && timestamp <= until {
-                        Some((EventId::from_slice(&k).ok()?, Timestamp::from(timestamp)))
+                    // skip invalid data
+                    if k.len() != 32 || v.len() != 8 {
+                        warn!("Invalid KV entry in rocksdb: {:?} => {:?}", k, v);
+                        return None;
+                    }
+                    let k = unsafe { &*(k.as_slice().as_ptr() as *const [u8; 32]) };
+                    let v = unsafe { &*(v.as_slice().as_ptr() as *const [u8; 8]) };
+                    if v > min && v < max {
+                        Some((k, v))
                     } else {
                         None
                     }
@@ -47,53 +54,41 @@ impl SledIndex {
             .collect()
     }
 
-    /// Returns the number of items in the index database
-    ///
-    /// **WARNING:** Can take a very long time if your index is very large, this operation is O(n)
-    pub fn count_keys(&self) -> u64 {
-        let ret = self.item_count.load(Ordering::SeqCst);
+    fn count_keys(&self) -> u64 {
+        let ret = self.item_count.load(Ordering::Relaxed);
         ret as u64
     }
 
-    /// Is the index empty
-    pub fn is_index_empty(&self) -> bool {
+    fn contains_key(&self, id: &[u8; 32]) -> Result<bool> {
+        self.database.contains_key(id).map_err(|e| anyhow!(e))
+    }
+
+    fn is_index_empty(&self) -> bool {
         self.database.is_empty()
     }
 
-    pub fn clear(&self) -> Result<()> {
-        self.database.clear().map_err(|e| anyhow!(e))
+    fn setup_for_reindex(&mut self) -> Result<()> {
+        Ok(())
     }
 
-    pub fn insert(&self, id: EventId, timestamp: Timestamp) -> Result<()> {
-        self.database
-            .insert(id, &timestamp.as_secs().to_le_bytes())
-            .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+    fn insert(&self, k: [u8; 32], v: [u8; 8]) -> Result<()> {
+        self.database.insert(k.as_slice(), v.as_slice())?;
         self.item_count.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn insert_raw(&self, id: &[u8], timestamp: u64) -> anyhow::Result<()> {
-        anyhow::ensure!(id.len() == 32, "Id must be 32 bytes long");
-        self.database
-            .insert(id, timestamp.to_le_bytes())
-            .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
-        self.item_count.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-
-    pub fn insert_batch(&self, items: Vec<(EventId, Timestamp)>) -> Result<()> {
+    fn insert_batch(&self, items: Vec<([u8; 32], [u8; 8])>) -> Result<()> {
         let mut batch = sled::Batch::default();
         let len = items.len();
         for (k, v) in items {
-            batch.insert(k.as_bytes(), &v.as_secs().to_le_bytes());
+            batch.insert(k.as_slice(), v.as_slice());
         }
         self.database.apply_batch(batch)?;
         self.item_count.fetch_add(len, Ordering::Relaxed);
         Ok(())
     }
 
-    pub fn contains_key(&self, id: &EventId) -> Result<bool> {
-        self.database.contains_key(id).map_err(|e| anyhow!(e))
+    fn wipe(&mut self) -> Result<()> {
+        self.database.clear().map_err(|e| anyhow!(e))
     }
 }

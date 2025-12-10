@@ -1,6 +1,4 @@
-use log::info;
 use std::path::PathBuf;
-use std::str::from_utf8;
 
 #[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash)]

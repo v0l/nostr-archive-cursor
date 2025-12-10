@@ -1,49 +1,36 @@
-use crate::NostrCursor;
 use anyhow::{Result, anyhow};
-use async_compression::tokio::write::ZstdEncoder;
 use chrono::{DateTime, NaiveDate, Utc};
-use log::{debug, error, info, warn};
+use log::{debug, warn};
 use nostr_sdk::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Events, NostrDatabase,
     RejectedReason, SaveEventStatus,
 };
-use nostr_sdk::{Event, EventId, Filter, JsonUtil, Timestamp};
+use nostr_sdk::{Event, EventId, Filter, Timestamp};
 use std::fmt::{Debug, Formatter};
 use std::fs::create_dir_all;
-use std::io::Error;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::mpsc::error::TryRecvError;
 
-#[cfg(feature = "db-sled")]
-mod sled;
-#[cfg(feature = "db-sled")]
-pub type IndexDb = sled::SledIndex;
-
-#[cfg(feature = "db-rocksdb")]
+mod file;
+pub use file::*;
 mod rocksdb;
-#[cfg(feature = "db-rocksdb")]
-pub type IndexDb = rocksdb::RocksDbIndex;
+mod sled;
 
-/// Flat JSON-L file database for nostr_sdk
-#[derive(Clone)]
-pub struct JsonFilesDatabase {
-    /// Directory where flat files are contained
-    out_dir: PathBuf,
-    /// Event id index database
-    database: IndexDb,
-    /// Current file being written to
-    file: Arc<Mutex<FlatFileWriter>>,
+/// KV index database for tracking event ids + timestamps
+pub trait IndexDb: Clone + Send + Sync {
+    /// List entries by V range
+    fn list_ids<'a>(&'a self, min: &[u8; 8], max: &[u8; 8]) -> Vec<(&'a [u8; 32], &'a [u8; 8])>;
+    fn count_keys(&self) -> u64;
+    fn contains_key(&self, id: &[u8; 32]) -> Result<bool>;
+    fn is_index_empty(&self) -> bool;
+    /// Reconfigure the database for faster bulk loading
+    fn setup_for_reindex(&mut self) -> Result<()>;
+    fn insert(&self, k: [u8; 32], v: [u8; 8]) -> Result<()>;
+    fn insert_batch(&self, items: Vec<([u8; 32], [u8; 8])>) -> Result<()>;
+    fn wipe(&mut self) -> Result<()>;
 }
 
-impl Debug for JsonFilesDatabase {
-    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
-        Ok(())
-    }
-}
-
+/// File information about existing archive files
 #[derive(Debug, Clone)]
 pub struct ArchiveFile {
     pub path: PathBuf,
@@ -53,19 +40,97 @@ pub struct ArchiveFile {
     pub timestamp: DateTime<Utc>,
 }
 
-impl JsonFilesDatabase {
-    pub fn new(dir: &Path) -> Result<Self> {
-        create_dir_all(dir)?;
-        let db = IndexDb::open(&dir.join("index"))?;
+/// Compressed JSON-L file database for nostr_sdk
+#[derive(Clone)]
+pub struct JsonFilesDatabase<D> {
+    /// Directory where flat files are contained
+    out_dir: PathBuf,
+    /// Event id index database
+    database: D,
+    /// Writer to send events to the file writer thread
+    tx_writer: tokio::sync::mpsc::UnboundedSender<Event>,
+}
+
+impl<D> Debug for JsonFilesDatabase<D> {
+    fn fmt(&self, _f: &mut Formatter<'_>) -> std::fmt::Result {
+        Ok(())
+    }
+}
+
+impl<D> JsonFilesDatabase<D> {
+    pub const EVENT_FORMAT: &'static str = "%Y%m%d";
+
+    pub fn new_with_index<P>(dir: P, index: D) -> Result<Self>
+    where
+        for<'a> PathBuf: From<&'a P>,
+    {
+        let dir = PathBuf::from(&dir);
+        create_dir_all(&dir)?;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let dir_writer = dir.clone();
+        let _ = std::thread::Builder::new()
+            .name("JsonFilesDatabase::writer".into())
+            .spawn(move || {
+                let mut current_path = Self::get_archive_path(&dir_writer, &Utc::now());
+                let mut writer =
+                    CompressedJsonLFile::new(&current_path).expect("Failed to open archive");
+                loop {
+                    match rx.try_recv() {
+                        Ok(e) => {
+                            // swap files if current path is different
+                            let current = Self::get_archive_path(&dir_writer, &Utc::now());
+                            if current != current_path {
+                                writer = CompressedJsonLFile::new(&current)
+                                    .expect("Failed to open archive");
+                                current_path = current;
+                            }
+
+                            writer
+                                .write_event(&e)
+                                .expect("Failed to write event to archive");
+                        }
+                        Err(p) => match p {
+                            TryRecvError::Empty => {
+                                // sleep if no data
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            }
+                            TryRecvError::Disconnected => {
+                                break;
+                            }
+                        },
+                    }
+                }
+            });
         Ok(Self {
-            out_dir: dir.to_path_buf(),
-            database: db,
-            file: Arc::new(Mutex::new(FlatFileWriter {
-                dir: dir.to_path_buf(),
-                current_date: Utc::now(),
-                current_handle: None,
-            })),
+            out_dir: dir,
+            database: index,
+            tx_writer: tx,
         })
+    }
+
+    pub fn get_archive_path(base: &Path, time: &DateTime<Utc>) -> PathBuf {
+        PathBuf::from(base.join(format!(
+            "events_{}.jsonl.zst",
+            time.format(Self::EVENT_FORMAT)
+        )))
+    }
+
+    /// Parse the timestamp from the file name
+    pub fn parse_timestamp(path: &Path) -> Option<DateTime<Utc>> {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(|s| s.split('_').next_back()) // split events_{date}
+            .and_then(|s| s.split('.').next()) // remove any more extensions
+            .and_then(|s| match NaiveDate::parse_from_str(s, Self::EVENT_FORMAT) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    warn!("Failed to parse timestamp from {}: {}", path.display(), e);
+                    None
+                }
+            })
+            .and_then(|d| d.and_hms_opt(0, 0, 0))
+            .map(|d| d.and_utc())
     }
 
     pub async fn list_files(&self) -> Result<Vec<ArchiveFile>> {
@@ -78,7 +143,7 @@ impl JsonFilesDatabase {
 
             let meta = entry.metadata().await?;
             let created_date = meta.created()?.into();
-            let parsed_date = if let Some(d) = FlatFileWriter::parse_timestamp(&entry.path()) {
+            let parsed_date = if let Some(d) = Self::parse_timestamp(&entry.path()) {
                 d
             } else {
                 created_date
@@ -99,8 +164,7 @@ impl JsonFilesDatabase {
         let p = self.out_dir.join(&path[1..]);
         if p.exists() && p.is_file() {
             let meta = p.metadata()?;
-            let parsed_date =
-                FlatFileWriter::parse_timestamp(&p).ok_or(anyhow!("Filename invalid"))?;
+            let parsed_date = Self::parse_timestamp(&p).ok_or(anyhow!("Filename invalid"))?;
             Ok(ArchiveFile {
                 path: p,
                 size: meta.len(),
@@ -111,10 +175,24 @@ impl JsonFilesDatabase {
             Err(anyhow!("No such file or directory"))
         }
     }
+}
 
+impl<D> JsonFilesDatabase<D>
+where
+    D: IndexDb + 'static,
+{
     /// List key/value pairs from the index database
     pub fn list_ids(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
-        self.database.list_ids(since, until)
+        self.database
+            .list_ids(&since.to_le_bytes(), &until.to_le_bytes())
+            .into_iter()
+            .filter_map(|(k, v)| {
+                Some((
+                    EventId::from_slice(k).ok()?,
+                    Timestamp::from_secs(u64::from_le_bytes(v.as_slice().try_into().ok()?)),
+                ))
+            })
+            .collect()
     }
 
     /// Returns the number of items in the index database
@@ -135,15 +213,10 @@ impl JsonFilesDatabase {
     /// faster than the async version for CPU-bound workloads like JSON parsing.
     #[cfg(feature = "sync")]
     pub fn rebuild_index(&mut self) -> Result<()> {
-        #[cfg(feature = "db-rocksdb")]
-        let last_print = Arc::new(AtomicU64::new(Timestamp::now().as_secs()));
-        #[cfg(feature = "db-rocksdb")]
+        self.database.wipe()?;
         self.database.setup_for_reindex()?;
-        #[cfg(feature = "db-rocksdb")]
-        use std::sync::atomic::{AtomicU64, Ordering};
-
         let db = self.database.clone();
-        NostrCursor::new(self.out_dir.clone())
+        crate::NostrCursor::new(self.out_dir.clone())
             .with_max_parallelism()
             .walk_with_chunked_sync(
                 move |events| {
@@ -153,20 +226,11 @@ impl JsonFilesDatabase {
                         if event.id.len() == 64
                             && faster_hex::hex_decode(event.id.as_bytes(), &mut id).is_ok()
                         {
-                            batch.push((
-                                EventId::from_slice(&id).unwrap(),
-                                Timestamp::from_secs(event.created_at),
-                            ));
+                            batch.push((id, event.created_at.to_le_bytes()));
                         }
                     }
                     if let Err(e) = db.insert_batch(batch) {
                         warn!("Failed to apply index update: {}", e);
-                    }
-
-                    #[cfg(feature = "db-rocksdb")]
-                    if (Timestamp::now().as_secs() - last_print.load(Ordering::Relaxed)) > 10 {
-                        last_print.store(Timestamp::now().as_secs(), Ordering::Relaxed);
-                        db.print_memory_usage();
                     }
                 },
                 1000,
@@ -176,7 +240,10 @@ impl JsonFilesDatabase {
     }
 }
 
-impl NostrDatabase for JsonFilesDatabase {
+impl<D> NostrDatabase for JsonFilesDatabase<D>
+where
+    D: IndexDb + 'static,
+{
     fn backend(&self) -> Backend {
         Backend::Custom("JsonFileDatabase".to_owned())
     }
@@ -188,18 +255,21 @@ impl NostrDatabase for JsonFilesDatabase {
         Box::pin(async move {
             match self
                 .database
-                .contains_key(&event.id)
+                .contains_key(event.id.as_bytes())
                 .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?
             {
                 false => {
                     self.database
-                        .insert(event.id, event.created_at)
+                        .insert(
+                            event.id.as_bytes().clone(),
+                            event.created_at.as_secs().to_le_bytes(),
+                        )
                         .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?;
 
-                    let mut fl = self.file.lock().await;
-                    fl.write_event(event)
-                        .await
-                        .map_err(|e| DatabaseError::Backend(Box::new(Error::other(e))))?;
+                    self.tx_writer
+                        .send(event.clone())
+                        .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
+
                     debug!("Saved event: {}", event.id);
                     Ok(SaveEventStatus::Success)
                 }
@@ -215,7 +285,7 @@ impl NostrDatabase for JsonFilesDatabase {
         Box::pin(async move {
             if self
                 .database
-                .contains_key(event_id)
+                .contains_key(event_id.as_bytes())
                 .map_err(|e| DatabaseError::Backend(e.into_boxed_dyn_error()))?
             {
                 Ok(DatabaseEventStatus::Saved)
@@ -249,101 +319,30 @@ impl NostrDatabase for JsonFilesDatabase {
     }
 }
 
-pub struct FlatFileWriter {
-    pub dir: PathBuf,
-    pub current_date: DateTime<Utc>,
-    pub current_handle: Option<(PathBuf, File)>,
+#[cfg(feature = "db-rocksdb")]
+pub type DefaultJsonFilesDatabase = JsonFilesDatabase<rocksdb::RocksDbIndex>;
+#[cfg(feature = "db-rocksdb")]
+impl DefaultJsonFilesDatabase {
+    pub fn new<P>(path: P) -> Result<Self>
+    where
+        for<'a> PathBuf: From<&'a P>,
+    {
+        let p = PathBuf::from(&path);
+        let db = rocksdb::RocksDbIndex::open(p.join("index-rocksdb"))?;
+        JsonFilesDatabase::new_with_index(path, db)
+    }
 }
 
-impl FlatFileWriter {
-    pub const EVENT_FORMAT: &'static str = "%Y%m%d";
-
-    /// Spawn a task to compress a file
-    async fn compress_file(file: PathBuf) -> Result<()> {
-        let out_path = file.with_extension("jsonl.zst");
-        let mut in_file = File::open(file.clone()).await?;
-        {
-            let out_file = File::create(out_path.clone()).await?;
-            let mut enc = ZstdEncoder::new(out_file);
-            let mut buf: [u8; 1024] = [0; 1024];
-            while let Ok(n) = in_file.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-                enc.write_all(&buf[..n]).await?;
-            }
-            enc.shutdown().await?;
-        }
-
-        let in_size = in_file.metadata().await?.len();
-        let out_size = File::open(out_path).await?.metadata().await?.len();
-        drop(in_file);
-        tokio::fs::remove_file(file).await?;
-        info!(
-            "Compressed file ratio={:.2}x, size={}M",
-            in_size as f32 / out_size as f32,
-            out_size as f32 / 1024.0 / 1024.0
-        );
-
-        Ok(())
-    }
-
-    /// Write event to the current file handle, or move to the next file handle
-    pub(crate) async fn write_event(&mut self, ev: &Event) -> Result<()> {
-        let now = Utc::now();
-        if self.current_date.format(Self::EVENT_FORMAT).to_string()
-            != now.format(Self::EVENT_FORMAT).to_string()
-        {
-            if let Some((path, ref mut handle)) = self.current_handle.take() {
-                handle.flush().await?;
-                info!("Closing file {:?}", &path);
-                tokio::spawn(async move {
-                    if let Err(e) = Self::compress_file(path).await {
-                        error!("Failed to compress file: {}", e);
-                    }
-                });
-            }
-
-            // open new file
-            self.current_date = now;
-        }
-
-        if self.current_handle.is_none() {
-            let path = self.dir.join(format!(
-                "events_{}.jsonl",
-                self.current_date.format(Self::EVENT_FORMAT)
-            ));
-            info!("Creating file {:?}", &path);
-            self.current_handle = Some((
-                path.clone(),
-                OpenOptions::new()
-                    .append(true)
-                    .create(true)
-                    .open(path)
-                    .await?,
-            ));
-        }
-
-        if let Some((_path, handle)) = self.current_handle.as_mut() {
-            handle.write_all(ev.as_json().as_bytes()).await?;
-            handle.write(b"\n").await?;
-        }
-        Ok(())
-    }
-
-    pub fn parse_timestamp(path: &Path) -> Option<DateTime<Utc>> {
-        path.file_stem()
-            .and_then(|stem| stem.to_str())
-            .and_then(|s| s.split('_').next_back()) // split events_{date}
-            .and_then(|s| s.split('.').next()) // remove any more extensions
-            .and_then(|s| match NaiveDate::parse_from_str(s, Self::EVENT_FORMAT) {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    warn!("Failed to parse timestamp from {}: {}", path.display(), e);
-                    None
-                }
-            })
-            .and_then(|d| d.and_hms_opt(0, 0, 0))
-            .map(|d| d.and_utc())
+#[cfg(not(feature = "db-rocksdb"))]
+pub type DefaultJsonFilesDatabase = JsonFilesDatabase<sled::SledIndex>;
+#[cfg(not(feature = "db-rocksdb"))]
+impl DefaultJsonFilesDatabase {
+    pub fn new<P>(path: P) -> Result<Self>
+    where
+        for<'a> PathBuf: From<&'a P>,
+    {
+        let p = PathBuf::from(&path);
+        let db = sled::SledIndex::open(p.join("index-sled"))?;
+        JsonFilesDatabase::new_with_index(path, db)
     }
 }
