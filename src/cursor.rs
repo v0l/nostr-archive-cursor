@@ -642,7 +642,7 @@ impl NostrCursor {
                             };
 
                             let current = processed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                            info!("Reading [{}/{}]: {}", current, total_files, path.display());
+                            log::info!("Reading [{}/{}]: {}", current, total_files, path.display());
                             Self::read_file_sync_chunked(
                                 &path,
                                 &*callback,
@@ -736,7 +736,7 @@ impl NostrCursor {
             }
 
             if buffer_count == 0 {
-                info!("EOF. objects={objects}, events={events}");
+                log::info!("EOF. objects={objects}, events={events}");
                 break;
             }
 
@@ -768,7 +768,7 @@ impl NostrCursor {
                         log::warn!(
                             "Invalid json: {} {}",
                             e,
-                            from_utf8(json_bytes).unwrap_or("<invalid json>")
+                            std::str::from_utf8(json_bytes).unwrap_or("<invalid json>")
                         )
                     }
                 }

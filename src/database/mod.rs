@@ -14,7 +14,11 @@ use tokio::sync::mpsc::error::TryRecvError;
 mod file;
 pub use file::*;
 mod rocksdb;
+#[cfg(feature = "db-rocksdb")]
+pub use crate::database::rocksdb::*;
 mod sled;
+#[cfg(feature = "db-sled")]
+pub use crate::database::sled::*;
 
 /// KV index database for tracking event ids + timestamps
 pub trait IndexDb: Clone + Send + Sync {
