@@ -31,6 +31,10 @@ pub trait IndexDb: Clone + Send + Sync {
     fn insert(&self, k: [u8; 32], v: [u8; 8]) -> Result<()>;
     fn insert_batch(&self, items: Vec<([u8; 32], [u8; 8])>) -> Result<()>;
     fn wipe(&mut self) -> Result<()>;
+    /// Recompute the cached event count from the actual index data and persist it.
+    /// Used to repair a stale/incorrect cached count (e.g. after concurrent writers
+    /// or a crash overwrote it). Returns the corrected count.
+    fn repair_count(&self) -> Result<u64>;
 }
 
 /// File information about existing archive files
@@ -199,6 +203,15 @@ where
     /// Is the index empty
     pub fn is_index_empty(&self) -> bool {
         self.database.is_index_empty()
+    }
+
+    /// Recompute the cached event count from the actual index data and persist it.
+    ///
+    /// **WARNING:** This is an O(n) scan over the index. Use to repair a stale count
+    /// (e.g. after concurrent writers during a rollout left the persisted count wrong).
+    /// Returns the corrected count.
+    pub fn repair_count(&self) -> Result<u64> {
+        self.database.repair_count()
     }
 
     /// Wipe the index database. Exposed for integration tests and for callers that

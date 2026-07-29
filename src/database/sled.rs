@@ -91,4 +91,15 @@ impl IndexDb for SledIndex {
     fn wipe(&mut self) -> Result<()> {
         self.database.clear().map_err(|e| anyhow!(e))
     }
+
+    fn repair_count(&self) -> Result<u64> {
+        // sled has no separate meta count; rescan real (32-byte) keys.
+        let count = self
+            .database
+            .iter()
+            .filter(|x| x.as_ref().map(|(k, _)| k.len() == 32).unwrap_or(false))
+            .count();
+        self.item_count.store(count, Ordering::SeqCst);
+        Ok(count as u64)
+    }
 }

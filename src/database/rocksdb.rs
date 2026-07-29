@@ -210,6 +210,20 @@ impl IndexDb for RocksDbIndex {
         self.item_count.load(Ordering::SeqCst) == 0
     }
 
+    fn repair_count(&self) -> Result<u64> {
+        let database = self.database.as_ref().expect("Database not open");
+        // Full scan of real (32-byte) event keys; ignores the meta key.
+        let count = database
+            .iterator(IteratorMode::Start)
+            .filter(|x| x.as_ref().map(|(k, _)| k.len() == 32).unwrap_or(false))
+            .count();
+        self.item_count.store(count, Ordering::SeqCst);
+        database
+            .put(META_COUNT_KEY, (count as u64).to_le_bytes())
+            .map_err(|e| anyhow!(e))?;
+        Ok(count as u64)
+    }
+
     fn setup_for_reindex(&mut self) -> Result<()> {
         let path = {
             let db = self.database.take().expect("Database not open");

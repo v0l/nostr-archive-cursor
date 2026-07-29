@@ -119,3 +119,50 @@ async fn wipe_clears_index_and_count() {
     drop(db2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_count_fixes_stale_meta() {
+    // Reproduces the k8s rollout bug: a process opens the index, the persisted
+    // meta count is wrong (e.g. written as 0 by a concurrent writer), and restart
+    // trusts it. repair_count() must rescan real keys and fix it.
+    let dir = std::env::temp_dir().join(format!("nac-test-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let keys = Keys::generate();
+    let db = DefaultJsonFilesDatabase::new(&dir).unwrap();
+    for i in 0..30u64 {
+        let ev = make_event(&keys, &format!("repair {i}"), 30078, i);
+        db.save_event(&ev).await.unwrap();
+    }
+    assert_eq!(db.count_keys(), 30);
+    drop(db);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Simulate the stale-count scenario: overwrite the meta key with 0 directly.
+    {
+        let rocks = rocksdb::DB::open_default(dir.join("index-rocksdb")).unwrap();
+        rocks.put(b"__meta_count__", 0u64.to_le_bytes()).unwrap();
+        drop(rocks);
+    }
+
+    // Reopen: it trusts the (wrong) persisted 0 -> thinks index is empty
+    let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
+    assert_eq!(db2.count_keys(), 0, "stale meta count should be trusted on open");
+    assert!(db2.is_index_empty(), "stale meta makes index look empty");
+
+    // Repair: rescan must find the real 30 keys, fix the atomic + persisted value
+    let repaired = db2.repair_count().unwrap();
+    assert_eq!(repaired, 30, "repair should find all 30 real keys");
+    assert_eq!(db2.count_keys(), 30);
+    assert!(!db2.is_index_empty());
+
+    // Persist across reopen
+    drop(db2);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let db3 = DefaultJsonFilesDatabase::new(&dir).unwrap();
+    assert_eq!(db3.count_keys(), 30, "repaired count should persist");
+
+    drop(db3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
