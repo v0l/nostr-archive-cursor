@@ -278,15 +278,32 @@ impl IndexDb for RocksDbIndex {
     }
 
     fn setup_for_reindex(&mut self) -> Result<()> {
-        let path = {
-            let db = self.database.take().expect("Database not open");
-            let path = db.path().to_owned();
-            drop(db);
-            path
+        // Reopening with bulk-load options is a performance optimization for large
+        // reindexes. It requires exclusive access to the DB LOCK, which fails when
+        // another clone of this handle is still alive in the process. In that case
+        // fall back to the existing (already-open) handle - reindex still works
+        // correctly, just without the bulk-load tuning.
+        let Some(current) = self.database.as_ref() else {
+            return Err(anyhow!("Database not open"));
         };
-        let opts = Self::get_bulk_load_options();
-        let db = rocksdb::DB::open(&opts, path).map_err(|e| anyhow!(e))?;
-        self.database.replace(Arc::new(db));
+
+        // Only one strong reference -> we hold the handle exclusively and can reopen.
+        if Arc::strong_count(current) == 1 {
+            let path = {
+                let db = self.database.take().expect("Database not open");
+                let path = db.path().to_owned();
+                drop(db);
+                path
+            };
+            let opts = Self::get_bulk_load_options();
+            let db = rocksdb::DB::open(&opts, path).map_err(|e| anyhow!(e))?;
+            self.database.replace(Arc::new(db));
+        } else {
+            warn!(
+                "setup_for_reindex: {} handle clones alive; keeping existing handle (bulk-load tuning skipped)",
+                Arc::strong_count(current) - 1
+            );
+        }
         Ok(())
     }
 
@@ -314,20 +331,22 @@ impl IndexDb for RocksDbIndex {
     }
 
     fn wipe(&mut self) -> Result<()> {
-        // Close the current DB handle, destroy all data on disk, and reopen fresh.
-        let path = {
-            let db = self.database.take().expect("Database not open");
-            let path = db.path().to_owned();
-            drop(db);
-            path
-        };
-        rocksdb::DB::destroy(&rocksdb::Options::default(), &path).map_err(|e| anyhow!(e))?;
-        let db = rocksdb::DB::open_default(&path).map_err(|e| anyhow!(e))?;
-        // Reset the persisted count to zero
-        db.put(META_COUNT_KEY, 0u64.to_le_bytes())
-            .map_err(|e| anyhow!(e))?;
+        // Delete all keys in place using the open handle. This avoids the
+        // destroy+reopen approach, which fails when another clone of the DB handle
+        // in the same process still holds the file lock (RocksDB allows only one
+        // process/handle to own the LOCK at a time).
+        let database = self.database.as_ref().expect("Database not open");
+
+        let mut batch = rocksdb::WriteBatch::new();
+        for item in database.iterator(IteratorMode::Start) {
+            let (k, _) = item.map_err(|e| anyhow!(e))?;
+            batch.delete(&k);
+        }
+        // Reset the persisted count to zero in the same batch.
+        batch.put(META_COUNT_KEY, 0u64.to_le_bytes());
+        database.write(batch).map_err(|e| anyhow!(e))?;
+
         self.item_count.store(0, Ordering::SeqCst);
-        self.database.replace(Arc::new(db));
         Ok(())
     }
 }
