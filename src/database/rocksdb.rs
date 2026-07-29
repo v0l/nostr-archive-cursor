@@ -1,7 +1,7 @@
 #![cfg(feature = "db-rocksdb")]
 use crate::IndexDb;
 use anyhow::anyhow;
-use anyhow::{Result, bail};
+use anyhow::Result;
 use log::{debug, warn};
 use rocksdb::properties::{
     BLOCK_CACHE_CAPACITY, BLOCK_CACHE_PINNED_USAGE, BLOCK_CACHE_USAGE, CUR_SIZE_ACTIVE_MEM_TABLE,
@@ -14,6 +14,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// Meta key storing the number of indexed events (excluded from `list_ids` since
+/// it is not 32 bytes). Allows O(1) startup count instead of a full keyspace scan.
+const META_COUNT_KEY: &[u8] = b"__meta_count__";
+
 #[derive(Clone)]
 pub struct RocksDbIndex {
     database: Option<Arc<rocksdb::DB>>,
@@ -24,10 +28,28 @@ pub struct RocksDbIndex {
 impl RocksDbIndex {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let db = rocksdb::DB::open_default(path).map_err(|e| anyhow!(e))?;
-        let db_len = db.iterator(IteratorMode::Start).count();
+
+        // Try to read the persisted count first; fall back to a one-time full scan
+        // of 32-byte keys for legacy databases, then persist it for next time.
+        let initial_count = match db.get_pinned(META_COUNT_KEY) {
+            Ok(Some(val)) if val.len() >= 8 => {
+                let mut arr = [0u8; 8];
+                arr.copy_from_slice(&val[..8]);
+                u64::from_le_bytes(arr) as usize
+            }
+            _ => {
+                let count = db
+                    .iterator(IteratorMode::Start)
+                    .filter(|x| x.as_ref().map(|(k, _)| k.len() == 32).unwrap_or(false))
+                    .count();
+                let _ = db.put(META_COUNT_KEY, (count as u64).to_le_bytes());
+                count
+            }
+        };
+
         Ok(Self {
             database: Some(Arc::new(db)),
-            item_count: Arc::new(AtomicUsize::new(db_len)),
+            item_count: Arc::new(AtomicUsize::new(initial_count)),
         })
     }
 
@@ -185,8 +207,7 @@ impl IndexDb for RocksDbIndex {
     }
 
     fn is_index_empty(&self) -> bool {
-        let database = self.database.as_ref().expect("Database not open");
-        database.iterator(IteratorMode::Start).next().is_none()
+        self.item_count.load(Ordering::SeqCst) == 0
     }
 
     fn setup_for_reindex(&mut self) -> Result<()> {
@@ -204,24 +225,42 @@ impl IndexDb for RocksDbIndex {
 
     fn insert(&self, k: [u8; 32], v: [u8; 8]) -> Result<()> {
         let database = self.database.as_ref().expect("Database not open");
-        database.put(k, v).map_err(|e| anyhow!(e))?;
-        self.item_count.fetch_add(1, Ordering::Relaxed);
+        let new_count = self.item_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut batch = rocksdb::WriteBatch::new();
+        batch.put(k, v);
+        batch.put(META_COUNT_KEY, (new_count as u64).to_le_bytes());
+        database.write(batch).map_err(|e| anyhow!(e))?;
         Ok(())
     }
 
     fn insert_batch(&self, items: Vec<([u8; 32], [u8; 8])>) -> Result<()> {
         let database = self.database.as_ref().expect("Database not open");
         let mut batch = rocksdb::WriteBatch::new();
+        let n = items.len();
         for (k, v) in items {
             batch.put(k, v);
         }
-        let batch_size = batch.len();
+        let new_count = self.item_count.fetch_add(n, Ordering::Relaxed) + n;
+        batch.put(META_COUNT_KEY, (new_count as u64).to_le_bytes());
         database.write(batch)?;
-        self.item_count.fetch_add(batch_size, Ordering::Relaxed);
         Ok(())
     }
 
     fn wipe(&mut self) -> Result<()> {
-        bail!("Not supported")
+        // Close the current DB handle, destroy all data on disk, and reopen fresh.
+        let path = {
+            let db = self.database.take().expect("Database not open");
+            let path = db.path().to_owned();
+            drop(db);
+            path
+        };
+        rocksdb::DB::destroy(&rocksdb::Options::default(), &path).map_err(|e| anyhow!(e))?;
+        let db = rocksdb::DB::open_default(&path).map_err(|e| anyhow!(e))?;
+        // Reset the persisted count to zero
+        db.put(META_COUNT_KEY, 0u64.to_le_bytes())
+            .map_err(|e| anyhow!(e))?;
+        self.item_count.store(0, Ordering::SeqCst);
+        self.database.replace(Arc::new(db));
+        Ok(())
     }
 }

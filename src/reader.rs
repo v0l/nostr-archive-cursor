@@ -217,12 +217,36 @@ pub(crate) mod sync {
                 buffer.extend_from_slice(available);
                 self.reader.consume(buf_len);
 
-                // Safety check: panic if buffer grows beyond 50MB (likely runaway)
+                // Safety check: skip if buffer grows beyond 50MB (likely malformed input)
                 if buffer.len() > 50 * 1024 * 1024 {
-                    panic!(
-                        "JSON object buffer exceeded 50MB - likely malformed input. Buffer starts with: {:?}",
+                    log::error!(
+                        "JSON object exceeded 50MB, skipping to next line (malformed input). Starts with: {:?}",
                         String::from_utf8_lossy(&buffer[..buffer.len().min(200)])
                     );
+                    self.skip_to_newline()?;
+                    buffer.clear();
+                    return self.read_json_object(buffer);
+                }
+            }
+        }
+
+        /// Discard bytes until (and including) the next newline. Used to recover
+        /// from malformed/oversized input.
+        fn skip_to_newline(&mut self) -> std::io::Result<()> {
+            loop {
+                let available = self.reader.fill_buf()?;
+                if available.is_empty() {
+                    return Ok(());
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(pos) => {
+                        self.reader.consume(pos + 1);
+                        return Ok(());
+                    }
+                    None => {
+                        let len = available.len();
+                        self.reader.consume(len);
+                    }
                 }
             }
         }
@@ -446,12 +470,36 @@ pub(crate) mod not_sync {
                 buffer.extend_from_slice(available);
                 self.reader.consume(buf_len);
 
-                // Safety check: panic if buffer grows beyond 50MB (likely runaway)
+                // Safety check: skip if buffer grows beyond 50MB (likely malformed input)
                 if buffer.len() > 50 * 1024 * 1024 {
-                    panic!(
-                        "JSON object buffer exceeded 50MB - likely malformed input. Buffer starts with: {:?}",
+                    log::error!(
+                        "JSON object exceeded 50MB, skipping to next line (malformed input). Starts with: {:?}",
                         String::from_utf8_lossy(&buffer[..buffer.len().min(200)])
                     );
+                    self.skip_to_newline().await?;
+                    buffer.clear();
+                    return Box::pin(self.read_json_object(buffer)).await;
+                }
+            }
+        }
+
+        /// Discard bytes until (and including) the next newline. Used to recover
+        /// from malformed/oversized input.
+        async fn skip_to_newline(&mut self) -> std::io::Result<()> {
+            loop {
+                let available = self.reader.fill_buf().await?;
+                if available.is_empty() {
+                    return Ok(());
+                }
+                match available.iter().position(|&b| b == b'\n') {
+                    Some(pos) => {
+                        self.reader.consume(pos + 1);
+                        return Ok(());
+                    }
+                    None => {
+                        let len = available.len();
+                        self.reader.consume(len);
+                    }
                 }
             }
         }

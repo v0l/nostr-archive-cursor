@@ -13,7 +13,7 @@ db = ["dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio", "dep:
 db-sled = ["dep:sled", "db"]
 db-rocksdb = ["dep:rocksdb", "db"]
 async = ["dep:async-compression", "dep:futures", "dep:tokio"]
-stream = ["dep:async-stream"]
+stream = ["async", "dep:async-stream"]
 sync = ["dep:flate2", "dep:bzip2", "dep:zstd"]
 
 [dependencies]

@@ -1,5 +1,18 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "stream")]
+use crate::NostrEvent;
+#[cfg(feature = "stream")]
+use crate::reader::not_sync::ChunkedJsonReader;
+#[cfg(feature = "stream")]
+use futures::{Stream, StreamExt};
+#[cfg(feature = "stream")]
+use log::{debug, error, info};
+#[cfg(feature = "stream")]
+use std::collections::HashSet;
+#[cfg(feature = "stream")]
+use std::pin::Pin;
+
 #[cfg(any(feature = "sync", feature = "async"))]
 #[derive(Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId(pub [u8; 32]);
@@ -232,7 +245,7 @@ impl NostrCursor {
                     let mut events = 0u64;
 
                     loop {
-                        match read_json_object(&mut reader, &mut buffer).await {
+                        match reader.read_json_object(&mut buffer).await {
                             Ok(size) => {
                                 if size == 0 {
                                     info!("EOF. objects={objects}, events={events}");
@@ -372,7 +385,7 @@ impl NostrCursor {
                 let ids = ids.clone();
 
                 Some(Box::pin(async move {
-                    info!("Reading [{}/{}]: {}", idx + 1, total_files, path.display());
+                    log::info!("Reading [{}/{}]: {}", idx + 1, total_files, path.display());
                     Self::read_file_with_callback_chunked(path, callback, ids, chunk_size).await;
                 }))
             } else {
@@ -456,7 +469,7 @@ impl NostrCursor {
             }
 
             if buffer_count == 0 {
-                info!("EOF. objects={objects}, events={events}");
+                log::info!("EOF. objects={objects}, events={events}");
                 break;
             }
 

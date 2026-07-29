@@ -9,7 +9,6 @@ use nostr_sdk::{Event, EventId, Filter, Timestamp};
 use std::fmt::{Debug, Formatter};
 use std::fs::create_dir_all;
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc::error::TryRecvError;
 
 mod file;
 pub use file::*;
@@ -52,7 +51,7 @@ pub struct JsonFilesDatabase<D> {
     /// Event id index database
     database: D,
     /// Writer to send events to the file writer thread
-    tx_writer: tokio::sync::mpsc::UnboundedSender<Event>,
+    tx_writer: tokio::sync::mpsc::Sender<Event>,
 }
 
 impl<D> Debug for JsonFilesDatabase<D> {
@@ -71,7 +70,10 @@ impl<D> JsonFilesDatabase<D> {
         let dir = PathBuf::from(&dir);
         create_dir_all(&dir)?;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Bounded channel applies backpressure to callers (save_event) when the
+        // writer falls behind, instead of buffering unboundedly in memory.
+        const WRITER_CHANNEL_CAPACITY: usize = 20_000;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(WRITER_CHANNEL_CAPACITY);
         let dir_writer = dir.clone();
         let _ = std::thread::Builder::new()
             .name("JsonFilesDatabase::writer".into())
@@ -79,31 +81,19 @@ impl<D> JsonFilesDatabase<D> {
                 let mut current_path = Self::get_archive_path(&dir_writer, &Utc::now());
                 let mut writer =
                     CompressedJsonLFile::new(&current_path).expect("Failed to open archive");
-                loop {
-                    match rx.try_recv() {
-                        Ok(e) => {
-                            // swap files if current path is different
-                            let current = Self::get_archive_path(&dir_writer, &Utc::now());
-                            if current != current_path {
-                                writer = CompressedJsonLFile::new(&current)
-                                    .expect("Failed to open archive");
-                                current_path = current;
-                            }
-
-                            writer
-                                .write_event(&e)
-                                .expect("Failed to write event to archive");
-                        }
-                        Err(p) => match p {
-                            TryRecvError::Empty => {
-                                // sleep if no data
-                                std::thread::sleep(std::time::Duration::from_millis(100));
-                            }
-                            TryRecvError::Disconnected => {
-                                break;
-                            }
-                        },
+                // blocking_recv sleeps the thread until an event arrives (no busy-poll)
+                while let Some(e) = rx.blocking_recv() {
+                    // swap files if current path is different
+                    let current = Self::get_archive_path(&dir_writer, &Utc::now());
+                    if current != current_path {
+                        writer = CompressedJsonLFile::new(&current)
+                            .expect("Failed to open archive");
+                        current_path = current;
                     }
+
+                    writer
+                        .write_event(&e)
+                        .expect("Failed to write event to archive");
                 }
             });
         Ok(Self {
@@ -211,6 +201,12 @@ where
         self.database.is_index_empty()
     }
 
+    /// Wipe the index database. Exposed for integration tests and for callers that
+    /// need to reset before a full `rebuild_index`.
+    pub fn database_wipe_for_test(&mut self) -> Result<()> {
+        self.database.wipe()
+    }
+
     /// Rebuilt event id index using parallel std::thread workers.
     ///
     /// This method uses OS threads for true CPU parallelism, which is significantly
@@ -272,6 +268,7 @@ where
 
                     self.tx_writer
                         .send(event.clone())
+                        .await
                         .map_err(|e| DatabaseError::Backend(Box::new(e)))?;
 
                     debug!("Saved event: {}", event.id);
