@@ -166,3 +166,70 @@ async fn repair_count_fixes_stale_meta() {
     drop(db3);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_repairs_diverged_count_on_open() {
+    // Seed a real index, corrupt the persisted meta count to a far-off value, then
+    // reopen. open() should detect the divergence vs ESTIMATE_NUM_KEYS and auto-repair.
+    let dir = std::env::temp_dir().join(format!("nac-test-autorepair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let keys = Keys::generate();
+    const N: u64 = 5000; // large enough that ESTIMATE_NUM_KEYS is reliable & over ABS_THRESHOLD
+    {
+        let db = DefaultJsonFilesDatabase::new(&dir).unwrap();
+        for i in 0..N {
+            let ev = make_event(&keys, &format!("ar {i}"), 30078, i);
+            db.save_event(&ev).await.unwrap();
+        }
+        assert_eq!(db.count_keys(), N);
+        drop(db);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Corrupt meta count to 0 (simulates the k8s rollout stale-count bug)
+    {
+        let rocks = rocksdb::DB::open_default(dir.join("index-rocksdb")).unwrap();
+        rocks.put(b"__meta_count__", 0u64.to_le_bytes()).unwrap();
+    }
+
+    // Reopen: no manual repair_count() call - open() must self-heal
+    let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
+    assert_eq!(
+        db2.count_keys(),
+        N,
+        "open() should auto-repair a diverged count"
+    );
+    assert!(!db2.is_index_empty());
+
+    drop(db2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn does_not_repair_accurate_count_on_open() {
+    // A correct count must NOT be treated as diverged (no false-positive repair).
+    let dir = std::env::temp_dir().join(format!("nac-test-noautorepair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let keys = Keys::generate();
+    const N: u64 = 5000;
+    {
+        let db = DefaultJsonFilesDatabase::new(&dir).unwrap();
+        for i in 0..N {
+            let ev = make_event(&keys, &format!("ok {i}"), 30078, i);
+            db.save_event(&ev).await.unwrap();
+        }
+        drop(db);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    // Reopen without corruption: count must stay exactly N (accurate, no repair needed)
+    let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
+    assert_eq!(db2.count_keys(), N);
+
+    drop(db2);
+    let _ = std::fs::remove_dir_all(&dir);
+}

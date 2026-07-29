@@ -47,10 +47,63 @@ impl RocksDbIndex {
             }
         };
 
-        Ok(Self {
+        let index = Self {
             database: Some(Arc::new(db)),
             item_count: Arc::new(AtomicUsize::new(initial_count)),
-        })
+        };
+
+        // Sanity-check the cached count against RocksDB's key estimate. If a
+        // concurrent writer / crash left the persisted count badly wrong (e.g. reset
+        // to 0 during a k8s rollout while data remained), the two will diverge far
+        // beyond normal estimate noise. Auto-repair in that case so a restart
+        // recovers instead of trusting the stale count forever.
+        index.auto_repair_count_if_diverged();
+
+        Ok(index)
+    }
+
+    /// Compare the cached count with `ESTIMATE_NUM_KEYS` and run `repair_count()`
+    /// when they disagree by more than the threshold. Returns true if a repair ran.
+    ///
+    /// `ESTIMATE_NUM_KEYS` is an approximation and also counts the meta key, so we
+    /// only treat large divergences as corruption: the difference must exceed both
+    /// a relative ratio of the estimate and an absolute floor (to avoid false
+    /// positives on tiny databases where the estimate is unreliable).
+    fn auto_repair_count_if_diverged(&self) -> bool {
+        const REL_THRESHOLD: f64 = 0.10; // >10% divergence
+        const ABS_THRESHOLD: u64 = 1000; // ...and at least this many keys
+
+        let Some(database) = self.database.as_ref() else {
+            return false;
+        };
+        let estimate = match database.property_int_value(ESTIMATE_NUM_KEYS) {
+            Ok(Some(e)) => e,
+            _ => return false, // can't estimate -> don't touch
+        };
+
+        let cached = self.item_count.load(Ordering::SeqCst) as u64;
+        // Estimate includes the meta key (+1 when present).
+        let expected = cached.saturating_add(1);
+        let diff = estimate.abs_diff(expected);
+
+        let diverged = diff > ABS_THRESHOLD && (diff as f64) > REL_THRESHOLD * (estimate.max(1) as f64);
+
+        if diverged {
+            warn!(
+                "Event index count looks stale (cached={cached}, estimate={estimate}); \
+                 running repair_count() to rescan."
+            );
+            match self.repair_count() {
+                Ok(n) => {
+                    warn!("Event index count repaired: {cached} -> {n}");
+                    return true;
+                }
+                Err(e) => {
+                    warn!("auto repair_count() failed: {e}");
+                }
+            }
+        }
+        false
     }
 
     pub fn get_bulk_load_options() -> Options {
