@@ -231,6 +231,11 @@ where
         let db = self.database.clone();
         crate::NostrCursor::new(self.out_dir.clone())
             .with_max_parallelism()
+            // No in-memory dedupe during rebuild: it would buffer every event id in a
+            // DashMap (millions of ids -> OOM on large archives). Re-inserting the
+            // same id is a harmless idempotent overwrite in the KV index, so we just
+            // insert and repair the count afterwards.
+            .with_dedupe(false)
             .walk_with_chunked_sync(
                 move |events| {
                     let mut batch = Vec::with_capacity(events.len());
@@ -249,6 +254,9 @@ where
                 1000,
             );
 
+        // Overwrites above inflated the running count with duplicate re-inserts;
+        // rescan once to set the exact count.
+        self.database.repair_count()?;
         Ok(())
     }
 }
