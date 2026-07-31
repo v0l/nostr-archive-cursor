@@ -34,6 +34,10 @@ pub fn decode_event_id(hex_str: &str) -> Result<EventId, ()> {
 /// Skips duplicate events
 ///
 /// Works with compressed files too
+/// Largest buffer capacity a pooled read buffer may retain between chunks.
+/// Buffers that grew beyond this (rare oversized events) are reallocated small.
+const MAX_RETAINED_BUFFER: usize = 64 * 1024;
+
 pub struct NostrCursor {
     /// Directory to read archives from
     dir: PathBuf,
@@ -454,7 +458,18 @@ impl NostrCursor {
 
             // Read chunk_size JSON objects, reusing buffers from pool
             for buffer in buffer_pool.iter_mut() {
-                buffer.clear();
+                // Reuse the allocation for typical events, but don't let one
+                // giant event (long-form posts, base64 blobs go to ~512KB)
+                // permanently ratchet this slot up: the pool is chunk_size
+                // buffers per worker thread, so with default settings a few
+                // thousand oversized events grow the process by
+                // workers x chunk_size x max_event_size — gigabytes that are
+                // never returned.
+                if buffer.capacity() > MAX_RETAINED_BUFFER {
+                    *buffer = Vec::with_capacity(2048);
+                } else {
+                    buffer.clear();
+                }
                 match reader.read_json_object(buffer).await {
                     Ok(0) => break, // EOF
                     Ok(_) => {
@@ -734,7 +749,18 @@ impl NostrCursor {
 
             // Read chunk_size JSON objects
             for buffer in buffer_pool.iter_mut() {
-                buffer.clear();
+                // Reuse the allocation for typical events, but don't let one
+                // giant event (long-form posts, base64 blobs go to ~512KB)
+                // permanently ratchet this slot up: the pool is chunk_size
+                // buffers per worker thread, so with default settings a few
+                // thousand oversized events grow the process by
+                // workers x chunk_size x max_event_size — gigabytes that are
+                // never returned.
+                if buffer.capacity() > MAX_RETAINED_BUFFER {
+                    *buffer = Vec::with_capacity(2048);
+                } else {
+                    buffer.clear();
+                }
                 match reader.read_json_object(buffer) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
