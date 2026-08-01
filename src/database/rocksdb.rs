@@ -18,11 +18,29 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// it is not 32 bytes). Allows O(1) startup count instead of a full keyspace scan.
 const META_COUNT_KEY: &[u8] = b"__meta_count__";
 
+/// Meta key marking the secondary time index as complete. Until it is set,
+/// time-ranged queries return empty and a background thread backfills
+/// `time_key` entries for all pre-existing events.
+const META_TIMEIDX_KEY: &[u8] = b"__meta_timeidx__";
+
+/// Secondary index key for time-ranged lookups: big-endian `created_at`
+/// followed by the event id. Big-endian makes lexicographic key order equal
+/// numeric time order, so a day is one contiguous range scan. Distinguished
+/// from primary 32-byte id keys by length (40 bytes).
+fn time_key(id: &[u8; 32], ts: u64) -> [u8; 40] {
+    let mut k = [0u8; 40];
+    k[..8].copy_from_slice(&ts.to_be_bytes());
+    k[8..].copy_from_slice(id);
+    k
+}
+
 #[derive(Clone)]
 pub struct RocksDbIndex {
     database: Option<Arc<rocksdb::DB>>,
     /// Total number of events in the database
     item_count: Arc<AtomicUsize>,
+    /// Whether the secondary time index covers all existing entries.
+    time_ready: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RocksDbIndex {
@@ -47,9 +65,63 @@ impl RocksDbIndex {
             }
         };
 
+        let db = Arc::new(db);
+        // Time index state: complete flag present, or trivially complete when
+        // the database is empty. Otherwise backfill in the background —
+        // time-ranged queries return empty until it finishes.
+        let time_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        match db.get_pinned(META_TIMEIDX_KEY) {
+            Ok(Some(_)) => time_ready.store(true, Ordering::SeqCst),
+            _ if initial_count == 0 => {
+                let _ = db.put(META_TIMEIDX_KEY, [1u8]);
+                time_ready.store(true, Ordering::SeqCst);
+            }
+            _ => {
+                let db = db.clone();
+                let flag = time_ready.clone();
+                std::thread::Builder::new()
+                    .name("rocksdb-timeidx".into())
+                    .spawn(move || {
+                        warn!("building time index for {initial_count} existing events");
+                        let started = std::time::Instant::now();
+                        let mut batch = rocksdb::WriteBatch::new();
+                        let mut n = 0u64;
+                        for item in db.iterator(IteratorMode::Start) {
+                            let Ok((k, v)) = item else { break };
+                            if k.len() != 32 || v.len() != 8 {
+                                continue;
+                            }
+                            let id: &[u8; 32] = k.as_ref().try_into().unwrap();
+                            let ts = u64::from_le_bytes(v.as_ref().try_into().unwrap());
+                            batch.put(time_key(id, ts), []);
+                            n += 1;
+                            if batch.len() >= 100_000 {
+                                let b = std::mem::take(&mut batch);
+                                if let Err(e) = db.write(b) {
+                                    warn!("time index backfill write failed: {e}");
+                                    return;
+                                }
+                            }
+                        }
+                        if let Err(e) = db.write(batch) {
+                            warn!("time index backfill write failed: {e}");
+                            return;
+                        }
+                        let _ = db.put(META_TIMEIDX_KEY, [1u8]);
+                        flag.store(true, Ordering::SeqCst);
+                        warn!(
+                            "time index complete: {n} entries in {:.0}s",
+                            started.elapsed().as_secs_f64()
+                        );
+                    })
+                    .ok();
+            }
+        }
+
         let index = Self {
-            database: Some(Arc::new(db)),
+            database: Some(db),
             item_count: Arc::new(AtomicUsize::new(initial_count)),
+            time_ready,
         };
 
         // Sanity-check the cached count against RocksDB's key estimate. If a
@@ -81,9 +153,16 @@ impl RocksDbIndex {
             _ => return false, // can't estimate -> don't touch
         };
 
+        // While the time index is still backfilling, the keyspace is in
+        // flux between N and 2N keys; any divergence check would misfire.
+        if !self.time_index_ready() {
+            return false;
+        }
+
         let cached = self.item_count.load(Ordering::SeqCst) as u64;
-        // Estimate includes the meta key (+1 when present).
-        let expected = cached.saturating_add(1);
+        // Each event has a primary id key and a time-index key, plus the two
+        // meta keys.
+        let expected = cached.saturating_mul(2).saturating_add(2);
         let diff = estimate.abs_diff(expected);
 
         let diverged = diff > ABS_THRESHOLD && (diff as f64) > REL_THRESHOLD * (estimate.max(1) as f64);
@@ -216,30 +295,37 @@ impl RocksDbIndex {
 }
 
 impl IndexDb for RocksDbIndex {
-    fn list_ids(&self, min: &[u8; 8], max: &[u8; 8]) -> Vec<(&[u8; 32], &[u8; 8])> {
+    fn list_ids(&self, min: u64, max: u64) -> Vec<([u8; 32], u64)> {
+        if !self.time_index_ready() {
+            return Vec::new();
+        }
         let database = self.database.as_ref().expect("Database not open");
-        database
-            .iterator(IteratorMode::Start)
-            .into_iter()
-            .filter_map(|x| {
-                if let Ok((k, v)) = x {
-                    // skip invalid data
-                    if k.len() != 32 || v.len() != 8 {
-                        warn!("Invalid KV entry in rocksdb: {:?} => {:?}", k, v);
-                        return None;
-                    }
-                    let k = unsafe { &*(k.as_ptr() as *const [u8; 32]) };
-                    let v = unsafe { &*(v.as_ptr() as *const [u8; 8]) };
-                    if v > min && v < max {
-                        Some((k, v))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
+        let start = min.to_be_bytes();
+        let mut out = Vec::new();
+        for item in database.iterator(IteratorMode::From(&start, rocksdb::Direction::Forward)) {
+            let Ok((k, _)) = item else { break };
+            // Key order is prefix order: once the 8-byte time prefix exceeds
+            // `max` there is nothing further in range.
+            if k.len() < 8 {
+                continue;
+            }
+            let ts = u64::from_be_bytes(k[..8].try_into().unwrap());
+            if ts > max {
+                break;
+            }
+            // Skip interleaved primary (32-byte) id keys whose random prefix
+            // happens to fall inside the range.
+            if k.len() != 40 {
+                continue;
+            }
+            let id: [u8; 32] = k[8..].try_into().unwrap();
+            out.push((id, ts));
+        }
+        out
+    }
+
+    fn time_index_ready(&self) -> bool {
+        self.time_ready.load(Ordering::Relaxed)
     }
 
     fn count_keys(&self) -> u64 {
@@ -311,6 +397,7 @@ impl IndexDb for RocksDbIndex {
         let database = self.database.as_ref().expect("Database not open");
         let new_count = self.item_count.fetch_add(1, Ordering::Relaxed) + 1;
         let mut batch = rocksdb::WriteBatch::new();
+        batch.put(time_key(&k, u64::from_le_bytes(v)), []);
         batch.put(k, v);
         batch.put(META_COUNT_KEY, (new_count as u64).to_le_bytes());
         database.write(batch).map_err(|e| anyhow!(e))?;
@@ -322,6 +409,7 @@ impl IndexDb for RocksDbIndex {
         let mut batch = rocksdb::WriteBatch::new();
         let n = items.len();
         for (k, v) in items {
+            batch.put(time_key(&k, u64::from_le_bytes(v)), []);
             batch.put(k, v);
         }
         let new_count = self.item_count.fetch_add(n, Ordering::Relaxed) + n;
@@ -342,11 +430,70 @@ impl IndexDb for RocksDbIndex {
             let (k, _) = item.map_err(|e| anyhow!(e))?;
             batch.delete(&k);
         }
-        // Reset the persisted count to zero in the same batch.
+        // Reset the persisted count to zero in the same batch; an empty
+        // database trivially has a complete time index.
         batch.put(META_COUNT_KEY, 0u64.to_le_bytes());
+        batch.put(META_TIMEIDX_KEY, [1u8]);
         database.write(batch).map_err(|e| anyhow!(e))?;
 
         self.item_count.store(0, Ordering::SeqCst);
+        self.time_ready.store(true, Ordering::SeqCst);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[0] = n;
+        k[31] = n;
+        k
+    }
+
+    #[test]
+    fn time_range_queries() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = RocksDbIndex::open(dir.path()).unwrap();
+        assert!(idx.time_index_ready());
+        idx.insert(id(1), 100u64.to_le_bytes()).unwrap();
+        idx.insert_batch(vec![
+            (id(2), 200u64.to_le_bytes()),
+            (id(3), 300u64.to_le_bytes()),
+            (id(4), 65_000_000_000u64.to_le_bytes()),
+        ])
+        .unwrap();
+        let got = idx.list_ids(150, 300);
+        assert_eq!(
+            got,
+            vec![(id(2), 200), (id(3), 300)],
+            "inclusive numeric range in time order"
+        );
+        assert_eq!(idx.list_ids(0, u64::MAX).len(), 4);
+        assert_eq!(idx.count_keys(), 4, "time keys must not inflate the count");
+        assert!(idx.contains_key(&id(2)).unwrap());
+    }
+
+    #[test]
+    fn migration_backfills_legacy_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a legacy database: primary keys only, no time index flag.
+        {
+            let db = rocksdb::DB::open_default(dir.path()).unwrap();
+            db.put(id(7), 700u64.to_le_bytes()).unwrap();
+            db.put(id(8), 800u64.to_le_bytes()).unwrap();
+            db.put(META_COUNT_KEY, 2u64.to_le_bytes()).unwrap();
+        }
+        let idx = RocksDbIndex::open(dir.path()).unwrap();
+        // Backfill runs on a background thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !idx.time_index_ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(idx.time_index_ready(), "migration did not complete");
+        assert_eq!(idx.list_ids(700, 800), vec![(id(7), 700), (id(8), 800)]);
+        assert_eq!(idx.count_keys(), 2);
     }
 }

@@ -21,8 +21,15 @@ pub use crate::database::sled::*;
 
 /// KV index database for tracking event ids + timestamps
 pub trait IndexDb: Clone + Send + Sync {
-    /// List entries by V range
-    fn list_ids<'a>(&'a self, min: &[u8; 8], max: &[u8; 8]) -> Vec<(&'a [u8; 32], &'a [u8; 8])>;
+    /// List (event id, created_at) pairs with `min <= created_at <= max`.
+    /// May return an empty list until [`time_index_ready`](Self::time_index_ready).
+    fn list_ids(&self, min: u64, max: u64) -> Vec<([u8; 32], u64)>;
+    /// Whether time-ranged [`list_ids`](Self::list_ids) queries are servable.
+    /// Backends that build a time index in the background return `false`
+    /// until the index covers all existing entries.
+    fn time_index_ready(&self) -> bool {
+        true
+    }
     fn count_keys(&self) -> u64;
     fn contains_key(&self, id: &[u8; 32]) -> Result<bool>;
     fn is_index_empty(&self) -> bool;
@@ -179,16 +186,19 @@ impl<D> JsonFilesDatabase<D>
 where
     D: IndexDb + 'static,
 {
-    /// List key/value pairs from the index database
+    /// List (event id, created_at) pairs with `since <= created_at <= until`
+    /// (inclusive bounds). Returns an empty list while the backend's time
+    /// index is still being built — callers should treat that as "no local
+    /// knowledge", not as "no events".
     pub fn list_ids(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
+        if !self.database.time_index_ready() {
+            return Vec::new();
+        }
         self.database
-            .list_ids(&since.to_le_bytes(), &until.to_le_bytes())
+            .list_ids(since, until)
             .into_iter()
             .filter_map(|(k, v)| {
-                Some((
-                    EventId::from_slice(k).ok()?,
-                    Timestamp::from_secs(u64::from_le_bytes(v.as_slice().try_into().ok()?)),
-                ))
+                Some((EventId::from_slice(&k).ok()?, Timestamp::from_secs(v)))
             })
             .collect()
     }

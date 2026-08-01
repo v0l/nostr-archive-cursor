@@ -30,23 +30,19 @@ impl SledIndex {
 }
 
 impl IndexDb for SledIndex {
-    fn list_ids<'a>(&'a self, min: &[u8; 8], max: &[u8; 8]) -> Vec<(&'a [u8; 32], &'a [u8; 8])> {
+    fn list_ids(&self, min: u64, max: u64) -> Vec<([u8; 32], u64)> {
+        // Full scan with numeric comparison. Sled has no secondary time
+        // index; this backend is not used for large archives.
         self.database
             .iter()
             .filter_map(|x| {
-                if let Ok((k, v)) = x {
-                    // skip invalid data
-                    if k.len() != 32 || v.len() != 8 {
-                        warn!("Invalid KV entry in rocksdb: {:?} => {:?}", k, v);
-                        return None;
-                    }
-                    let k = unsafe { &*(k.as_slice().as_ptr() as *const [u8; 32]) };
-                    let v = unsafe { &*(v.as_slice().as_ptr() as *const [u8; 8]) };
-                    if v > min && v < max {
-                        Some((k, v))
-                    } else {
-                        None
-                    }
+                let (k, v) = x.ok()?;
+                if k.len() != 32 || v.len() != 8 {
+                    return None;
+                }
+                let ts = u64::from_le_bytes(v.as_ref().try_into().ok()?);
+                if ts >= min && ts <= max {
+                    Some((k.as_ref().try_into().ok()?, ts))
                 } else {
                     None
                 }
