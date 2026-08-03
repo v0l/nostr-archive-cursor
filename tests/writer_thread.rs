@@ -43,6 +43,7 @@ async fn writer_thread_persists_and_dedupes() {
     }
 
     // Index should contain exactly 100 unique events (dedupe is inline/synchronous)
+    db.flush().await.unwrap();
     assert_eq!(db.count_keys(), 100, "expected 100 unique events indexed");
 
     // Every event id should be findable via check_id
@@ -73,6 +74,7 @@ async fn meta_count_persists_across_reopen() {
             let ev = make_event(&keys, &format!("persist {i}"), 30078, i);
             db.save_event(&ev).await.unwrap();
         }
+        db.flush().await.unwrap();
         assert_eq!(db.count_keys(), 25);
         drop(db);
     }
@@ -102,6 +104,7 @@ async fn wipe_clears_index_and_count() {
         let ev = make_event(&keys, &format!("wipe {i}"), 30078, i);
         db.save_event(&ev).await.unwrap();
     }
+    db.flush().await.unwrap();
     assert_eq!(db.count_keys(), 40);
     assert!(!db.is_index_empty());
 
@@ -135,6 +138,7 @@ async fn repair_count_fixes_stale_meta() {
         let ev = make_event(&keys, &format!("repair {i}"), 30078, i);
         db.save_event(&ev).await.unwrap();
     }
+    db.flush().await.unwrap();
     assert_eq!(db.count_keys(), 30);
     drop(db);
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -183,6 +187,7 @@ async fn auto_repairs_diverged_count_on_open() {
             let ev = make_event(&keys, &format!("ar {i}"), 30078, i);
             db.save_event(&ev).await.unwrap();
         }
+        db.flush().await.unwrap();
         assert_eq!(db.count_keys(), N);
         drop(db);
         tokio::time::sleep(Duration::from_millis(300)).await;

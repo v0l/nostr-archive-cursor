@@ -1,0 +1,501 @@
+//! Frame index sidecar (`<shard>.frames`).
+//!
+//! Offsets stored in the event index are offsets into the *decompressed*
+//! stream. To avoid decoding a whole shard for one lookup, the writer emits
+//! bounded zstd frames and records every frame boundary here:
+//!
+//! ```text
+//! header: b"NAFR" || u32_le version(1)
+//! record: u64_le uncompressed_start || u64_le compressed_start   (16 bytes)
+//! ```
+//!
+//! A record is appended when a boundary is *created*, so the last record is
+//! the start of the frame currently being written - which is exactly the state
+//! a writer needs to resume appending, and lets a reader compute each frame's
+//! extent from the following record.
+//!
+//! Fixed-size records mean the table is binary-searchable. Concatenated zstd
+//! frames are still a valid `.zst` file, so `zstd -d` and all existing reader
+//! paths keep working whether or not a sidecar exists.
+
+use anyhow::{Result, bail};
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+
+pub const FRAME_MAGIC: &[u8; 4] = b"NAFR";
+pub const FRAME_VERSION: u32 = 1;
+pub const FRAME_HEADER_LEN: u64 = 8;
+pub const FRAME_RECORD_LEN: u64 = 16;
+
+/// Sidecar path for a shard (`events_x.jsonl.zst` -> `events_x.jsonl.zst.frames`).
+pub fn sidecar_path(shard: &Path) -> PathBuf {
+    let mut s = shard.as_os_str().to_os_string();
+    s.push(".frames");
+    PathBuf::from(s)
+}
+
+/// One frame boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameStart {
+    /// Offset of the first byte of this frame in the decompressed stream.
+    pub uncompressed: u64,
+    /// Offset of the first byte of this frame in the compressed file.
+    pub compressed: u64,
+}
+
+/// Byte range to read + decode in order to reach a given offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSpan {
+    pub uncompressed_start: u64,
+    pub compressed_start: u64,
+    /// End of the compressed frame, or `None` when it is the last (open) frame
+    /// and therefore runs to EOF.
+    pub compressed_end: Option<u64>,
+}
+
+/// Loaded sidecar.
+///
+/// Records are kept as raw bytes and binary-searched in place: at the default
+/// 64 KiB frame target a 5 GB shard has ~80k records (1.3 MB), and parsing
+/// that into a `Vec<FrameStart>` on first touch would cost more than the
+/// lookups it serves. Reading the bytes is one sequential read; searching them
+/// is `log2(n)` slice reads with no allocation.
+#[derive(Debug, Default, Clone)]
+pub struct FrameTable {
+    /// `n * 16` bytes: `u64_le uncompressed || u64_le compressed`.
+    records: Vec<u8>,
+}
+
+impl FrameTable {
+    pub fn from_starts(starts: Vec<FrameStart>) -> Self {
+        let mut records = Vec::with_capacity(starts.len() * 16);
+        for s in starts {
+            records.extend_from_slice(&s.uncompressed.to_le_bytes());
+            records.extend_from_slice(&s.compressed.to_le_bytes());
+        }
+        Self { records }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len() / FRAME_RECORD_LEN as usize
+    }
+
+    /// Boundary at index `i`.
+    pub fn get(&self, i: usize) -> Option<FrameStart> {
+        let r = self.records.get(i * 16..i * 16 + 16)?;
+        Some(FrameStart {
+            uncompressed: u64::from_le_bytes(r[..8].try_into().unwrap()),
+            compressed: u64::from_le_bytes(r[8..].try_into().unwrap()),
+        })
+    }
+
+    /// All boundaries, materialised. For tests and tooling - the read path
+    /// uses [`get`](Self::get)/[`span_for`](Self::span_for) instead.
+    pub fn starts(&self) -> Vec<FrameStart> {
+        (0..self.len()).filter_map(|i| self.get(i)).collect()
+    }
+
+    /// Largest gap between consecutive frame starts, i.e. the biggest frame we
+    /// know the extent of. `None` when the table has fewer than two records,
+    /// which means the archive is one (unbounded) frame as far as we can tell.
+    ///
+    /// Used to decide whether an imported archive needs reframing: a single
+    /// giant frame makes every lookup decode from the start of the file.
+    pub fn max_frame_span(&self) -> Option<u64> {
+        let n = self.len();
+        if n < 2 {
+            return None;
+        }
+        let mut max = 0;
+        let mut prev = self.get(0)?.uncompressed;
+        for i in 1..n {
+            let cur = self.get(i)?.uncompressed;
+            max = max.max(cur.saturating_sub(prev));
+            prev = cur;
+        }
+        Some(max)
+    }
+
+    /// The last boundary, i.e. the start of the frame currently being appended.
+    pub fn last(&self) -> Option<FrameStart> {
+        self.len().checked_sub(1).and_then(|i| self.get(i))
+    }
+
+    /// Load a sidecar. Returns `Ok(None)` when it does not exist (legacy or
+    /// externally-dropped shard) - callers then decode from offset 0.
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        let mut f = match File::open(path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut header = [0u8; FRAME_HEADER_LEN as usize];
+        if let Err(e) = f.read_exact(&mut header) {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                return Ok(None); // empty/truncated sidecar: treat as absent
+            }
+            return Err(e.into());
+        }
+        if &header[..4] != FRAME_MAGIC {
+            bail!("{}: bad frame index magic", path.display());
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        if version != FRAME_VERSION {
+            bail!("{}: unsupported frame index version {version}", path.display());
+        }
+
+        let mut records = Vec::new();
+        f.read_to_end(&mut records)?;
+        // A crash can leave a partial record; ignore the tail.
+        records.truncate(records.len() / 16 * 16);
+        let table = Self { records };
+        // Boundaries must be strictly increasing; anything else means a
+        // corrupt sidecar and we would rather rebuild than seek to garbage.
+        // (Cheap: one pass over ~16 bytes per frame, done once per shard.)
+        let mut prev: Option<FrameStart> = None;
+        for i in 0..table.len() {
+            let cur = table.get(i).unwrap();
+            if let Some(p) = prev
+                && (cur.uncompressed <= p.uncompressed || cur.compressed <= p.compressed)
+            {
+                bail!("{}: non-monotonic frame index", path.display());
+            }
+            prev = Some(cur);
+        }
+        Ok(Some(table))
+    }
+
+    /// Compressed range that must be decoded to read `offset..end`.
+    ///
+    /// Frames are not guaranteed to break between events: the writer cuts at
+    /// event boundaries, but a reframed or externally-produced archive can
+    /// split an event across frames. So the span runs to the end of the last
+    /// frame the range touches, not just the first one. zstd decodes
+    /// concatenated frames transparently.
+    pub fn span_for_range(&self, offset: u64, end: u64) -> FrameSpan {
+        let start = self.span_for(offset);
+        let n = self.len();
+        if n == 0 {
+            return start;
+        }
+        // First boundary at or past `end`: everything before it is needed.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid).unwrap().uncompressed < end {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        FrameSpan {
+            compressed_end: self.get(lo).map(|s| s.compressed),
+            ..start
+        }
+    }
+
+    /// Find the frame containing `offset` (an offset in the decompressed
+    /// stream). Falls back to "one frame starting at 0" when the table is
+    /// empty, which is exactly the legacy single-frame layout.
+    pub fn span_for(&self, offset: u64) -> FrameSpan {
+        let n = self.len();
+        if n == 0 {
+            return FrameSpan {
+                uncompressed_start: 0,
+                compressed_start: 0,
+                compressed_end: None,
+            };
+        }
+        // Greatest boundary with `uncompressed <= offset`.
+        let (mut lo, mut hi) = (0usize, n);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.get(mid).unwrap().uncompressed <= offset {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // `lo` is the first boundary past `offset`; an offset before the very
+        // first boundary decodes from the start.
+        let idx = lo.saturating_sub(1);
+        let cur = self.get(idx).unwrap();
+        FrameSpan {
+            uncompressed_start: cur.uncompressed,
+            compressed_start: cur.compressed,
+            compressed_end: self.get(idx + 1).map(|s| s.compressed),
+        }
+    }
+}
+
+/// Appender for the sidecar, owned by the archive writer.
+pub struct FrameLog {
+    file: BufWriter<File>,
+}
+
+impl FrameLog {
+    /// Open (creating if needed) the sidecar for `shard`.
+    pub fn open(shard: &Path) -> Result<Self> {
+        Self::open_at(&sidecar_path(shard))
+    }
+
+    /// Open (creating if needed) a sidecar at an exact path.
+    pub fn open_at(path: &Path) -> Result<Self> {
+        let mut file = File::options()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        if file.seek(SeekFrom::End(0))? == 0 {
+            file.write_all(FRAME_MAGIC)?;
+            file.write_all(&FRAME_VERSION.to_le_bytes())?;
+        }
+        Ok(Self {
+            file: BufWriter::new(file),
+        })
+    }
+
+    /// Record a new frame boundary and flush it immediately: the sidecar must
+    /// never claim fewer frames than the shard actually contains.
+    pub fn append(&mut self, start: FrameStart) -> Result<()> {
+        self.file.write_all(&start.uncompressed.to_le_bytes())?;
+        self.file.write_all(&start.compressed.to_le_bytes())?;
+        self.file.flush()?;
+        Ok(())
+    }
+}
+
+/// Boundaries of every zstd frame in `data`, found by walking frame headers
+/// and block headers - no decompression.
+///
+/// Used to regenerate a sidecar for a shard written before framing existed
+/// (or imported from elsewhere). Returns the compressed offset of each frame
+/// plus the total compressed length consumed.
+pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
+    const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+    const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
+    const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
+
+    let mut offsets = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= data.len() {
+        let frame_start = pos;
+        let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
+            if pos + 4 > data.len() {
+                bail!("truncated skippable frame header");
+            }
+            let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos = pos.checked_add(4 + size).ok_or_else(|| {
+                anyhow::anyhow!("skippable frame size overflow")
+            })?;
+            continue; // not a data frame, no boundary recorded
+        }
+        if magic != ZSTD_MAGIC {
+            bail!("not a zstd frame at offset {frame_start}");
+        }
+
+        // Frame header
+        if pos >= data.len() {
+            bail!("truncated frame header descriptor");
+        }
+        let fhd = data[pos];
+        pos += 1;
+        let fcs_flag = fhd >> 6;
+        let single_segment = (fhd >> 5) & 1 == 1;
+        let checksum = (fhd >> 2) & 1 == 1;
+        let did_flag = fhd & 3;
+        if !single_segment {
+            pos += 1; // window descriptor
+        }
+        pos += match did_flag {
+            0 => 0,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        pos += match fcs_flag {
+            0 => usize::from(single_segment),
+            1 => 2,
+            2 => 4,
+            _ => 8,
+        };
+        if pos > data.len() {
+            bail!("truncated frame header");
+        }
+
+        // Blocks
+        loop {
+            if pos + 3 > data.len() {
+                bail!("truncated block header");
+            }
+            let hdr = u32::from(data[pos])
+                | (u32::from(data[pos + 1]) << 8)
+                | (u32::from(data[pos + 2]) << 16);
+            pos += 3;
+            let last = hdr & 1 == 1;
+            let block_type = (hdr >> 1) & 3;
+            let block_size = (hdr >> 3) as usize;
+            if block_type == 3 {
+                bail!("reserved zstd block type");
+            }
+            // RLE blocks are a single byte on the wire.
+            pos += if block_type == 1 { 1 } else { block_size };
+            if pos > data.len() {
+                bail!("truncated block body");
+            }
+            if last {
+                break;
+            }
+        }
+        if checksum {
+            pos += 4;
+            if pos > data.len() {
+                bail!("truncated frame checksum");
+            }
+        }
+        offsets.push(frame_start as u64);
+    }
+    Ok(offsets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    #[test]
+    fn sidecar_path_appends_suffix() {
+        assert_eq!(
+            sidecar_path(Path::new("/a/events_20250801.jsonl.zst")),
+            PathBuf::from("/a/events_20250801.jsonl.zst.frames")
+        );
+    }
+
+    #[test]
+    fn missing_sidecar_is_none_and_spans_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            FrameTable::load(&dir.path().join("nope.frames"))
+                .unwrap()
+                .is_none()
+        );
+        let empty = FrameTable::default();
+        assert_eq!(
+            empty.span_for(12_345),
+            FrameSpan {
+                uncompressed_start: 0,
+                compressed_start: 0,
+                compressed_end: None
+            }
+        );
+    }
+
+    #[test]
+    fn append_load_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("events_20250801.jsonl.zst");
+        let mut log = FrameLog::open(&shard).unwrap();
+        log.append(FrameStart {
+            uncompressed: 0,
+            compressed: 0,
+        })
+        .unwrap();
+        log.append(FrameStart {
+            uncompressed: 1000,
+            compressed: 400,
+        })
+        .unwrap();
+        log.append(FrameStart {
+            uncompressed: 2000,
+            compressed: 900,
+        })
+        .unwrap();
+        drop(log);
+
+        let t = FrameTable::load(&sidecar_path(&shard)).unwrap().unwrap();
+        assert_eq!(t.len(), 3);
+        assert_eq!(
+            t.last(),
+            Some(FrameStart {
+                uncompressed: 2000,
+                compressed: 900
+            })
+        );
+        assert_eq!(
+            t.span_for(0),
+            FrameSpan {
+                uncompressed_start: 0,
+                compressed_start: 0,
+                compressed_end: Some(400)
+            }
+        );
+        assert_eq!(
+            t.span_for(1500),
+            FrameSpan {
+                uncompressed_start: 1000,
+                compressed_start: 400,
+                compressed_end: Some(900)
+            }
+        );
+        // exact boundary hit
+        assert_eq!(t.span_for(2000).compressed_start, 900);
+        // inside the open tail frame
+        assert_eq!(t.span_for(9_999).compressed_end, None);
+
+        // A range crossing a boundary must cover every frame it touches.
+        let crossing = t.span_for_range(900, 1100);
+        assert_eq!(crossing.compressed_start, 0);
+        assert_eq!(
+            crossing.compressed_end,
+            Some(900),
+            "must decode through the second frame"
+        );
+        // A range spanning all frames runs to EOF.
+        assert_eq!(t.span_for_range(0, 9_999).compressed_end, None);
+        // A range inside one frame stops at that frame.
+        assert_eq!(t.span_for_range(1100, 1200).compressed_end, Some(900));
+    }
+
+    #[test]
+    fn partial_trailing_record_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("s.zst");
+        let mut log = FrameLog::open(&shard).unwrap();
+        log.append(FrameStart {
+            uncompressed: 0,
+            compressed: 0,
+        })
+        .unwrap();
+        drop(log);
+        // Simulate a crash mid-record.
+        let mut f = File::options()
+            .append(true)
+            .open(sidecar_path(&shard))
+            .unwrap();
+        f.write_all(&[1, 2, 3]).unwrap();
+        drop(f);
+        let t = FrameTable::load(&sidecar_path(&shard)).unwrap().unwrap();
+        assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn scan_finds_concatenated_frames() {
+        // Three independently compressed frames, concatenated - the layout the
+        // writer produces.
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..3u8 {
+            expected.push(data.len() as u64);
+            let payload = vec![i; 5000];
+            data.extend_from_slice(&zstd::encode_all(payload.as_slice(), 3).unwrap());
+        }
+        assert_eq!(scan_zstd_frame_offsets(&data).unwrap(), expected);
+    }
+}

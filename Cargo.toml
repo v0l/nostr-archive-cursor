@@ -4,13 +4,12 @@ description = "A utility library for iterating over JSON-L archives."
 repository = "https://github.com/v0l/nostr-archive-cursor.git"
 license = "MIT"
 readme = "README.md"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 
 [features]
 default = []
 db = ["dep:nostr-sdk", "dep:chrono", "dep:async-compression", "dep:tokio", "dep:zstd"]
-db-sled = ["dep:sled", "db"]
 db-rocksdb = ["dep:rocksdb", "db"]
 async = ["dep:async-compression", "dep:futures", "dep:tokio"]
 stream = ["async", "dep:async-stream"]
@@ -25,7 +24,7 @@ serde_json = "1"
 dashmap = "6.1"
 
 # async compression
-tokio = { version = "1", default-features = false, features = ["fs", "io-util"], optional = true }
+tokio = { version = "1", default-features = false, features = ["fs", "io-util", "rt", "sync"], optional = true }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zstdmt", "bzip2"], optional = true }
 async-stream = { version = "0.3", optional = true }
 futures = { version = "0.3", optional = true }
@@ -36,7 +35,6 @@ bzip2 = { version = "0.6", optional = true }
 
 # Database deps
 zstd = { version = "0.13", optional = true }
-sled = { version = "0.34", optional = true }
 rocksdb = { version = "0.24", optional = true, default-features = false, features = ["zstd"] }
 nostr-sdk = { version = "0.44", default-features = false, optional = true }
 chrono = { version = "0.4", optional = true }
@@ -45,6 +43,33 @@ chrono = { version = "0.4", optional = true }
 name = "nostr"
 required-features = ["sync", "db-rocksdb"]
 
+[[example]]
+name = "lookup_bench"
+required-features = ["db-rocksdb", "sync"]
+
+[[example]]
+name = "index_size"
+required-features = ["db-rocksdb", "sync"]
+
+[[example]]
+name = "real_archive_check"
+required-features = ["db-rocksdb", "sync"]
+
 [dev-dependencies]
 env_logger = "0.11"
+chrono = "0.4"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+anyhow = "1"
+
+[[example]]
+name = "incremental_check"
+required-features = ["db-rocksdb", "sync"]
+
+[[example]]
+name = "convert_check"
+required-features = ["db-rocksdb", "sync"]
+
+[[example]]
+name = "compaction_check"
+required-features = ["db-rocksdb", "sync"]

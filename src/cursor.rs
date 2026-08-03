@@ -38,9 +38,55 @@ pub fn decode_event_id(hex_str: &str) -> Result<EventId, ()> {
 /// Buffers that grew beyond this (rare oversized events) are reallocated small.
 const MAX_RETAINED_BUFFER: usize = 64 * 1024;
 
+/// An event plus where its JSON object starts in the decompressed stream.
+#[cfg(feature = "sync")]
+pub struct LocatedEvent<'a> {
+    pub event: crate::NostrEventBorrowed<'a>,
+    /// Byte offset of the opening `{` in the decompressed file.
+    pub offset: u64,
+    /// Length of the JSON object in bytes.
+    pub len: u32,
+}
+
+/// Is this read error just "the stream ends here"?
+///
+/// The live shard's last zstd frame is deliberately left open (the writer
+/// block-flushes so readers see events immediately without cutting a frame per
+/// batch), and archives can also be truncated mid-write. Both surface as a
+/// decode error at EOF and mean "no more events", not "corrupt archive".
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) fn is_end_of_stream(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        return true;
+    }
+    let msg = e.to_string();
+    msg.contains("incomplete frame") || msg.contains("Src size is incorrect")
+}
+
+/// Files an archive walk must ignore: our own frame-index sidecars, and empty
+/// files (a freshly rotated shard whose writer has not flushed yet).
+#[cfg(any(feature = "sync", feature = "async"))]
+pub(crate) fn is_walkable_archive(path: &std::path::Path) -> bool {
+    if path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.ends_with(".frames") || n.ends_with(".frames.tmp"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    match std::fs::metadata(path) {
+        Ok(m) => m.len() > 0,
+        Err(_) => false,
+    }
+}
+
 pub struct NostrCursor {
     /// Directory to read archives from
     dir: PathBuf,
+    /// When set, only these files are walked instead of everything in `dir`.
+    /// Used by incremental indexing to visit just the shards that changed.
+    only: Option<Vec<PathBuf>>,
     /// Number of files to process in parallel
     parallelism: usize,
     /// If deduplication should be performed
@@ -62,12 +108,15 @@ impl NostrCursor {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// use nostr_archive_cursor::NostrCursor;
+    ///
     /// let cursor = NostrCursor::new("./backups".into());
     /// ```
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            only: None,
             parallelism: 1,
             dedupe: true,
         }
@@ -87,10 +136,21 @@ impl NostrCursor {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// use nostr_archive_cursor::NostrCursor;
+    ///
     /// let cursor = NostrCursor::new("./backups".into())
     ///     .with_parallelism(4);
     /// ```
+    /// Walk only these files (they must live in the cursor's directory).
+    ///
+    /// Lets an incremental indexer re-read just the shards whose size or mtime
+    /// changed, instead of the whole archive.
+    pub fn with_files(mut self, files: Vec<PathBuf>) -> Self {
+        self.only = Some(files);
+        self
+    }
+
     pub fn with_parallelism(mut self, parallelism: usize) -> Self {
         self.parallelism = parallelism;
         self
@@ -109,7 +169,9 @@ impl NostrCursor {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// use nostr_archive_cursor::NostrCursor;
+    ///
     /// let cursor = NostrCursor::new("./backups".into())
     ///     .with_max_parallelism();
     /// ```
@@ -140,7 +202,9 @@ impl NostrCursor {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// use nostr_archive_cursor::NostrCursor;
+    ///
     /// // Disable deduplication for faster processing when duplicates aren't a concern
     /// let cursor = NostrCursor::new("./backups".into())
     ///     .with_dedupe(false);
@@ -200,6 +264,9 @@ impl NostrCursor {
             let mut files = Vec::new();
             while let Ok(Some(path)) = dir_reader.next_entry().await {
                 if path.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                if !is_walkable_archive(&path.path()) {
                     continue;
                 }
                 files.push(path.path());
@@ -272,7 +339,11 @@ impl NostrCursor {
                                 }
                             }
                             Err(e) => {
-                                error!("Error reading file: {}", e);
+                                if is_end_of_stream(&e) {
+                                    info!("EOF (open/truncated frame). objects={objects}, events={events}");
+                                } else {
+                                    error!("Error reading file: {}", e);
+                                }
                                 break;
                             }
                         }
@@ -365,6 +436,9 @@ impl NostrCursor {
         let mut files = Vec::new();
         while let Ok(Some(path)) = dir_reader.next_entry().await {
             if path.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            if !is_walkable_archive(&path.path()) {
                 continue;
             }
             files.push(path.path());
@@ -477,7 +551,11 @@ impl NostrCursor {
                         buffer_count += 1;
                     }
                     Err(e) => {
-                        log::error!("Error reading file: {}", e);
+                        if is_end_of_stream(&e) {
+                            log::debug!("EOF (open or truncated final frame)");
+                        } else {
+                            log::error!("Error reading file: {}", e);
+                        }
                         break;
                     }
                 }
@@ -589,7 +667,8 @@ impl NostrCursor {
     ///
     /// # Example
     ///
-    /// ```rust
+    /// ```rust,no_run
+    /// use nostr_archive_cursor::{NostrCursor, NostrEventBorrowed};
     /// use std::sync::atomic::{AtomicU64, Ordering};
     /// use std::sync::Arc;
     ///
@@ -600,7 +679,7 @@ impl NostrCursor {
     /// let counter = Arc::new(AtomicU64::new(0));
     /// let counter_clone = counter.clone();
     ///
-    /// cursor.walk_with_chunked_sync(move |events| {
+    /// cursor.walk_with_chunked_sync(move |events: Vec<NostrEventBorrowed>| {
     ///     counter_clone.fetch_add(events.len() as u64, Ordering::Relaxed);
     /// }, 1000);
     ///
@@ -610,23 +689,43 @@ impl NostrCursor {
     where
         F: Fn(Vec<crate::NostrEventBorrowed<'_>>) + Send + Sync + 'static,
     {
+        self.walk_with_chunked_sync_located(
+            move |_path, events| callback(events.into_iter().map(|e| e.event).collect()),
+            chunk_size,
+        )
+    }
+
+    /// Like [`walk_with_chunked_sync`](Self::walk_with_chunked_sync), but the
+    /// callback also receives the file each batch came from and the byte
+    /// offset/length of every event within it.
+    ///
+    /// This is what lets an index record `(shard, offset, len)` so events can
+    /// later be fetched by id without scanning.
+    pub fn walk_with_chunked_sync_located<F>(self, callback: F, chunk_size: usize)
+    where
+        F: Fn(&std::path::Path, Vec<LocatedEvent<'_>>) + Send + Sync + 'static,
+    {
         use std::sync::Arc;
         use std::sync::Mutex;
 
         let dir = self.dir.clone();
         let parallelism = self.parallelism;
 
-        // Read directory (sync)
-        let files: Vec<PathBuf> = match std::fs::read_dir(&dir) {
-            Ok(reader) => reader
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
-                .map(|e| e.path())
-                .collect(),
-            Err(e) => {
-                log::error!("Failed to read directory: {}", e);
-                return;
-            }
+        // Explicit file list, or everything in the directory.
+        let files: Vec<PathBuf> = match self.only {
+            Some(files) => files.into_iter().filter(|p| is_walkable_archive(p)).collect(),
+            None => match std::fs::read_dir(&dir) {
+                Ok(reader) => reader
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                    .map(|e| e.path())
+                    .filter(|p| is_walkable_archive(p))
+                    .collect(),
+                Err(e) => {
+                    log::error!("Failed to read directory: {}", e);
+                    return;
+                }
+            },
         };
 
         // Shared deduplication state
@@ -726,7 +825,7 @@ impl NostrCursor {
         ids: Option<std::sync::Arc<dashmap::DashMap<EventId, ()>>>,
         chunk_size: usize,
     ) where
-        F: Fn(Vec<crate::NostrEventBorrowed<'_>>),
+        F: Fn(&std::path::Path, Vec<LocatedEvent<'_>>),
     {
         let reader = match Self::open_file_sync(path) {
             Ok(r) => r,
@@ -743,6 +842,8 @@ impl NostrCursor {
         // Pre-allocate reusable buffers
         let mut buffer_pool: Vec<Vec<u8>> =
             (0..chunk_size).map(|_| Vec::with_capacity(2048)).collect();
+        // Offset of each buffered object in the decompressed stream.
+        let mut offsets: Vec<u64> = vec![0; chunk_size];
 
         loop {
             let mut buffer_count = 0;
@@ -764,11 +865,16 @@ impl NostrCursor {
                 match reader.read_json_object(buffer) {
                     Ok(0) => break, // EOF
                     Ok(_) => {
+                        offsets[buffer_count] = reader.last_object_offset();
                         objects += 1;
                         buffer_count += 1;
                     }
                     Err(e) => {
-                        log::error!("Error reading file: {}", e);
+                        if is_end_of_stream(&e) {
+                            log::debug!("EOF (open or truncated final frame)");
+                        } else {
+                            log::error!("Error reading file: {}", e);
+                        }
                         break;
                     }
                 }
@@ -780,10 +886,14 @@ impl NostrCursor {
             }
 
             // Parse all JSON objects
-            let mut parsed_events: Vec<crate::NostrEventBorrowed> =
-                Vec::with_capacity(buffer_count);
+            let mut parsed_events: Vec<LocatedEvent> = Vec::with_capacity(buffer_count);
 
-            for json_bytes in &buffer_pool[..buffer_count] {
+            for (i, json_bytes) in buffer_pool[..buffer_count].iter().enumerate() {
+                let located = |event| LocatedEvent {
+                    event,
+                    offset: offsets[i],
+                    len: json_bytes.len() as u32,
+                };
                 match serde_json::from_slice::<crate::NostrEventBorrowed>(json_bytes) {
                     Ok(event) => {
                         if let Some(ref ids_map) = ids {
@@ -796,11 +906,11 @@ impl NostrCursor {
 
                             if ids_map.insert(ev_id, ()).is_none() {
                                 events += 1;
-                                parsed_events.push(event);
+                                parsed_events.push(located(event));
                             }
                         } else {
                             events += 1;
-                            parsed_events.push(event);
+                            parsed_events.push(located(event));
                         }
                     }
                     Err(e) => {
@@ -814,7 +924,7 @@ impl NostrCursor {
             }
 
             if !parsed_events.is_empty() {
-                callback(parsed_events);
+                callback(path, parsed_events);
             }
         }
     }

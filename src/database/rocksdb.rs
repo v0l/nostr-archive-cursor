@@ -1,4 +1,5 @@
 #![cfg(feature = "db-rocksdb")]
+use crate::database::value::{IndexEntry, V0_LEN};
 use crate::IndexDb;
 use anyhow::anyhow;
 use anyhow::Result;
@@ -13,6 +14,25 @@ use rocksdb::{BlockBasedOptions, IteratorMode, Options};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// Prefix for indexer bookkeeping keys (per-shard state).
+///
+/// Bookkeeping lives in the default column family - adding a column family
+/// would stop any tool that opens the index with plain `DB::open` from working.
+/// That is safe because event keys are distinguished purely by *length*
+/// (32 = primary, 40 = time index), and [`meta_key`] guarantees bookkeeping
+/// keys are never either length.
+pub const META_PREFIX: &[u8] = b"shard/";
+
+/// Build a bookkeeping key that can never be mistaken for an event key.
+pub fn meta_key(name: &str) -> Vec<u8> {
+    let mut k = META_PREFIX.to_vec();
+    k.extend_from_slice(name.as_bytes());
+    while k.len() == 32 || k.len() == 40 {
+        k.push(b'/');
+    }
+    k
+}
 
 /// Meta key storing the number of indexed events (excluded from `list_ids` since
 /// it is not 32 bytes). Allows O(1) startup count instead of a full keyspace scan.
@@ -44,8 +64,33 @@ pub struct RocksDbIndex {
 }
 
 impl RocksDbIndex {
+    /// Options used for normal (non-bulk-load) operation.
+    ///
+    /// `DB::open_default` asks for Snappy, which this build does not include,
+    /// so the index ends up **uncompressed**. Event ids are random and
+    /// incompressible, but the rest (v1 values, the big-endian timestamps that
+    /// prefix the time index) is not, so zstd is worth having. A bloom filter
+    /// keeps `contains_key`/`get` from touching disk for absent ids, which is
+    /// the dominant lookup pattern.
+    pub fn get_options() -> Options {
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+
+        let mut table = BlockBasedOptions::default();
+        table.set_bloom_filter(10.0, false);
+        // Keys are 32/40 bytes with no shared prefix worth indexing, so bigger
+        // blocks trade a little read amplification for much less index size.
+        table.set_block_size(16 * 1024);
+        table.set_cache_index_and_filter_blocks(true);
+        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
+        opts.set_block_based_table_factory(&table);
+
+        opts
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let db = rocksdb::DB::open_default(path).map_err(|e| anyhow!(e))?;
+        let db = rocksdb::DB::open(&Self::get_options(), path).map_err(|e| anyhow!(e))?;
 
         // Try to read the persisted count first; fall back to a one-time full scan
         // of 32-byte keys for legacy databases, then persist it for next time.
@@ -88,11 +133,15 @@ impl RocksDbIndex {
                         let mut n = 0u64;
                         for item in db.iterator(IteratorMode::Start) {
                             let Ok((k, v)) = item else { break };
-                            if k.len() != 32 || v.len() != 8 {
+                            if k.len() != 32 || v.len() < V0_LEN {
                                 continue;
                             }
                             let id: &[u8; 32] = k.as_ref().try_into().unwrap();
-                            let ts = u64::from_le_bytes(v.as_ref().try_into().unwrap());
+                            // Values may be v0 (8 bytes) or v1 (27); only the
+                            // timestamp prefix matters here.
+                            let Some(ts) = IndexEntry::decode_created_at(&v) else {
+                                continue;
+                            };
                             batch.put(time_key(id, ts), []);
                             n += 1;
                             if batch.len() >= 100_000 {
@@ -210,10 +259,34 @@ impl RocksDbIndex {
         // Optimize for bulk loading
         opts.prepare_for_bulk_load();
 
-        let table_opts = BlockBasedOptions::default();
+        // Same on-disk layout as steady state, or a reindex would rewrite the
+        // whole index uncompressed.
+        opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
+        let mut table_opts = BlockBasedOptions::default();
+        table_opts.set_bloom_filter(10.0, false);
+        table_opts.set_block_size(16 * 1024);
         opts.set_block_based_table_factory(&table_opts);
 
         opts
+    }
+
+    /// Rewrite every SST with the current options.
+    ///
+    /// Existing databases were written **uncompressed** (the previous options
+    /// asked for Snappy, which this build does not include). Opening with the
+    /// new options does not rewrite anything: old files keep their old format
+    /// and are converted only as normal compaction touches them. This forces
+    /// that conversion now, at the cost of one full rewrite of the index.
+    pub fn compact(&self) {
+        let Some(db) = self.database.as_ref() else {
+            return;
+        };
+        // `compact_range` alone will not do it: manual compaction skips the
+        // bottommost level unless forced, and in a mostly-static index that is
+        // where all the old data lives - so it would silently rewrite nothing.
+        let mut opts = rocksdb::CompactOptions::default();
+        opts.set_bottommost_level_compaction(rocksdb::BottommostLevelCompaction::Force);
+        db.compact_range_opt(None::<&[u8]>, None::<&[u8]>, &opts);
     }
 
     pub fn print_memory_usage(&self) {
@@ -393,29 +466,94 @@ impl IndexDb for RocksDbIndex {
         Ok(())
     }
 
-    fn insert(&self, k: [u8; 32], v: [u8; 8]) -> Result<()> {
+    fn insert(&self, k: [u8; 32], v: IndexEntry) -> Result<()> {
         let database = self.database.as_ref().expect("Database not open");
         let new_count = self.item_count.fetch_add(1, Ordering::Relaxed) + 1;
         let mut batch = rocksdb::WriteBatch::new();
-        batch.put(time_key(&k, u64::from_le_bytes(v)), []);
-        batch.put(k, v);
+        batch.put(time_key(&k, v.created_at), []);
+        batch.put(k, v.encode().as_slice());
         batch.put(META_COUNT_KEY, (new_count as u64).to_le_bytes());
         database.write(batch).map_err(|e| anyhow!(e))?;
         Ok(())
     }
 
-    fn insert_batch(&self, items: Vec<([u8; 32], [u8; 8])>) -> Result<()> {
+    fn insert_batch(&self, items: Vec<([u8; 32], IndexEntry)>) -> Result<usize> {
         let database = self.database.as_ref().expect("Database not open");
+
+        // Re-inserting an id is an idempotent overwrite, so only count keys
+        // that are actually new. One batched read with bloom filters costs
+        // almost nothing when the keys are absent (the bulk-load case), and it
+        // keeps the cached count exact instead of needing an O(n) rescan.
+        let keys: Vec<[u8; 32]> = items.iter().map(|(k, _)| *k).collect();
+        let existing = database.multi_get(&keys);
+
         let mut batch = rocksdb::WriteBatch::new();
-        let n = items.len();
-        for (k, v) in items {
-            batch.put(time_key(&k, u64::from_le_bytes(v)), []);
-            batch.put(k, v);
+        let mut new_keys = 0usize;
+        for ((k, v), present) in items.into_iter().zip(existing) {
+            if !matches!(present, Ok(Some(_))) {
+                new_keys += 1;
+            }
+            batch.put(time_key(&k, v.created_at), []);
+            batch.put(k, v.encode().as_slice());
         }
-        let new_count = self.item_count.fetch_add(n, Ordering::Relaxed) + n;
+        let new_count = self.item_count.fetch_add(new_keys, Ordering::Relaxed) + new_keys;
         batch.put(META_COUNT_KEY, (new_count as u64).to_le_bytes());
         database.write(batch)?;
-        Ok(())
+        Ok(new_keys)
+    }
+
+    fn get_meta(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let database = self.database.as_ref().expect("Database not open");
+        database.get(key).map_err(|e| anyhow!(e))
+    }
+
+    fn put_meta(&self, key: &[u8], value: &[u8]) -> Result<()> {
+        let database = self.database.as_ref().expect("Database not open");
+        database.put(key, value).map_err(|e| anyhow!(e))
+    }
+
+    fn clear_meta(&self) -> Result<()> {
+        let database = self.database.as_ref().expect("Database not open");
+        let mut batch = rocksdb::WriteBatch::new();
+        for item in database.prefix_iterator(META_PREFIX) {
+            let (k, _) = item.map_err(|e| anyhow!(e))?;
+            if !k.starts_with(META_PREFIX) {
+                break;
+            }
+            batch.delete(&k);
+        }
+        database.write(batch).map_err(|e| anyhow!(e))
+    }
+
+    fn get(&self, id: &[u8; 32]) -> Result<Option<IndexEntry>> {
+        let database = self.database.as_ref().expect("Database not open");
+        match database.get_pinned(id).map_err(|e| anyhow!(e))? {
+            Some(v) => Ok(Some(IndexEntry::decode(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn get_many(&self, ids: &[[u8; 32]]) -> Vec<Option<IndexEntry>> {
+        let database = self.database.as_ref().expect("Database not open");
+        // One batched read: better block locality than N point lookups.
+        database
+            .multi_get(ids)
+            .into_iter()
+            .map(|r| match r {
+                Ok(Some(v)) => match IndexEntry::decode(&v) {
+                    Ok(e) => Some(e),
+                    Err(e) => {
+                        warn!("corrupt index value: {e}");
+                        None
+                    }
+                },
+                Ok(None) => None,
+                Err(e) => {
+                    warn!("index multi_get failed: {e}");
+                    None
+                }
+            })
+            .collect()
     }
 
     fn wipe(&mut self) -> Result<()> {
@@ -435,6 +573,9 @@ impl IndexDb for RocksDbIndex {
         batch.put(META_COUNT_KEY, 0u64.to_le_bytes());
         batch.put(META_TIMEIDX_KEY, [1u8]);
         database.write(batch).map_err(|e| anyhow!(e))?;
+
+        // Indexer bookkeeping describes data that no longer exists.
+        self.clear_meta()?;
 
         self.item_count.store(0, Ordering::SeqCst);
         self.time_ready.store(true, Ordering::SeqCst);
@@ -458,11 +599,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let idx = RocksDbIndex::open(dir.path()).unwrap();
         assert!(idx.time_index_ready());
-        idx.insert(id(1), 100u64.to_le_bytes()).unwrap();
+        idx.insert(id(1), IndexEntry::new(100)).unwrap();
         idx.insert_batch(vec![
-            (id(2), 200u64.to_le_bytes()),
-            (id(3), 300u64.to_le_bytes()),
-            (id(4), 65_000_000_000u64.to_le_bytes()),
+            (id(2), IndexEntry::new(200)),
+            (id(3), IndexEntry::new(300)),
+            (id(4), IndexEntry::new(65_000_000_000)),
         ])
         .unwrap();
         let got = idx.list_ids(150, 300);
@@ -495,5 +636,37 @@ mod tests {
         assert!(idx.time_index_ready(), "migration did not complete");
         assert_eq!(idx.list_ids(700, 800), vec![(id(7), 700), (id(8), 800)]);
         assert_eq!(idx.count_keys(), 2);
+        // Legacy 8-byte values decode as v0: known timestamp, unknown location.
+        let got = idx.get(&id(7)).unwrap().unwrap();
+        assert_eq!(got.created_at, 700);
+        assert!(got.loc.is_none());
+    }
+
+    #[test]
+    fn stores_and_returns_locations() {
+        use crate::database::value::{EventLoc, shard_hash};
+        let dir = tempfile::tempdir().unwrap();
+        let idx = RocksDbIndex::open(dir.path()).unwrap();
+        let loc = EventLoc {
+            shard: shard_hash("events_20250801.jsonl.zst"),
+            offset: 4096,
+            len: 512,
+        };
+        idx.insert(id(1), IndexEntry::located(100, loc)).unwrap();
+        idx.insert_batch(vec![(id(2), IndexEntry::new(200))])
+            .unwrap();
+
+        assert_eq!(idx.get(&id(1)).unwrap().unwrap().loc, Some(loc));
+        assert_eq!(idx.get(&id(2)).unwrap().unwrap().loc, None);
+        assert!(idx.get(&id(9)).unwrap().is_none());
+
+        // Located entries must not disturb the time index or the count.
+        assert_eq!(idx.list_ids(0, u64::MAX).len(), 2);
+        assert_eq!(idx.count_keys(), 2);
+
+        let many = idx.get_many(&[id(1), id(9), id(2)]);
+        assert_eq!(many[0].unwrap().loc, Some(loc));
+        assert!(many[1].is_none());
+        assert_eq!(many[2].unwrap().created_at, 200);
     }
 }
