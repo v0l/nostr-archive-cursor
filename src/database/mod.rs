@@ -15,7 +15,10 @@ use std::sync::Arc;
 
 mod file;
 pub mod frames;
-pub use frames::{FrameSpan, FrameStart, FrameTable, sidecar_path};
+pub use frames::{
+    Damage, FrameSpan, FrameStart, FrameTable, ScanReport, scan_zstd_frame_starts,
+    scan_zstd_frames, sidecar_path,
+};
 mod pool;
 mod value;
 pub use file::*;
@@ -113,6 +116,9 @@ pub struct JsonFilesDatabase<D> {
     /// What to do when the index knows an event exists but not where it is
     /// (a v0 entry, or a shard that moved).
     scan_fallback: ScanFallback,
+    /// Salvage damaged shards encountered while indexing (see
+    /// [`with_auto_repair`](JsonFilesDatabase::with_auto_repair)).
+    auto_repair: bool,
 }
 
 /// How hard to look for an event whose location the index does not know.
@@ -144,6 +150,9 @@ pub struct IndexReport {
     pub indexed: usize,
     /// Shards rewritten into bounded frames first.
     pub reframed: usize,
+    /// Damaged shards salvaged before indexing (see
+    /// [`repair_archive`](crate::repair_archive)).
+    pub repaired: usize,
     /// Event ids that were not already in the index.
     pub new_events: u64,
 }
@@ -285,6 +294,13 @@ enum WriterMsg {
     /// Acknowledged once every event queued before it has been written *and*
     /// indexed. Used by [`JsonFilesDatabase::flush`].
     Flush(tokio::sync::oneshot::Sender<()>),
+    /// Close the current shard and release its lock, so maintenance can
+    /// rewrite it. The writer reopens on the next event.
+    ///
+    /// Acked over a `std::sync` channel on purpose: the only callers are
+    /// synchronous maintenance paths (`rebuild_index`), which may run on a
+    /// runtime thread where `blocking_recv` on a tokio channel would panic.
+    Release(std::sync::mpsc::SyncSender<()>),
 }
 
 impl<D> JsonFilesDatabase<D> {
@@ -396,9 +412,12 @@ where
                 // exists once the event has been written, and batching the
                 // updates removes the per-event WriteBatch this used to do.
                 let mut current_path = Self::get_archive_path(&dir_writer, &Utc::now());
-                let mut writer =
+                // `None` while the shard is released for maintenance; reopened
+                // on the next event.
+                let mut writer = Some(
                     CompressedJsonLFile::with_frame_target(&current_path, frame_target)
-                        .expect("Failed to open archive");
+                        .expect("Failed to open archive"),
+                );
                 let mut shard = shard_hash_of(&current_path);
                 let mut batch: Vec<([u8; 32], IndexEntry)> = Vec::with_capacity(WRITER_BATCH);
 
@@ -409,20 +428,30 @@ where
                     while let Some(m) = msg.take() {
                         match m {
                             WriterMsg::Flush(ack) => acks.push(ack),
+                            WriterMsg::Release(ack) => {
+                                // Drop closes the frame cleanly and releases
+                                // the advisory lock.
+                                writer = None;
+                                let _ = ack.send(());
+                            }
                             WriterMsg::Event(e) => {
                                 // swap files if current path is different
                                 let current = Self::get_archive_path(&dir_writer, &Utc::now());
-                                if current != current_path {
-                                    writer = CompressedJsonLFile::with_frame_target(
-                                        &current,
-                                        frame_target,
-                                    )
-                                    .expect("Failed to open archive");
+                                if current != current_path || writer.is_none() {
+                                    writer = Some(
+                                        CompressedJsonLFile::with_frame_target(
+                                            &current,
+                                            frame_target,
+                                        )
+                                        .expect("Failed to open archive"),
+                                    );
                                     shard = shard_hash_of(&current);
                                     current_path = current;
                                 }
 
                                 let loc = writer
+                                    .as_mut()
+                                    .expect("reopened above")
                                     .write_event(&e)
                                     .expect("Failed to write event to archive");
                                 batch.push((
@@ -443,7 +472,9 @@ where
                     // Flush before indexing: an index entry must never point
                     // at bytes a reader cannot decode yet. This is a zstd
                     // block flush, so frames still grow to frame_target.
-                    if let Err(e) = writer.flush() {
+                    if let Some(w) = writer.as_mut()
+                        && let Err(e) = w.flush()
+                    {
                         warn!("Failed to flush archive: {e}");
                     }
                     let ids: Vec<[u8; 32]> = batch.iter().map(|(k, _)| *k).collect();
@@ -476,6 +507,7 @@ where
             frame_target,
             in_flight,
             scan_fallback: ScanFallback::default(),
+            auto_repair: true,
         })
     }
 
@@ -494,10 +526,56 @@ where
         rx.await.map_err(|e| anyhow!("writer thread is gone: {e}"))
     }
 
+    /// Make the writer close and unlock the shard it is appending to.
+    ///
+    /// Maintenance that rewrites a shard (reframe, repair) renames a new file
+    /// into place. A live writer's descriptor would then point at the unlinked
+    /// inode and every event it wrote afterwards would vanish - so it has to
+    /// let go first. It reopens on the next event, resuming from the sidecar.
+    ///
+    /// Synchronous and safe to call from inside a runtime: the request is a
+    /// non-blocking `try_send` and the ack comes back over a std channel.
+    /// Returns whether the writer acknowledged.
+    fn release_live_shard(&self) -> bool {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+        // The queue is bounded; under load it can be briefly full.
+        for _ in 0..100 {
+            match self.tx_writer.try_send(WriterMsg::Release(ack_tx.clone())) {
+                Ok(()) => {
+                    return ack_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .is_ok();
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+        warn!("writer queue stayed full; leaving the live shard locked");
+        false
+    }
+
     /// How to handle events whose location the index does not know
     /// (see [`ScanFallback`]). Defaults to [`ScanFallback::Day`].
     pub fn with_scan_fallback(mut self, mode: ScanFallback) -> Self {
         self.scan_fallback = mode;
+        self
+    }
+
+    /// Salvage damaged shards during indexing instead of skipping past them.
+    /// On by default.
+    ///
+    /// Indexing is the only moment the whole archive is inspected, so it is
+    /// where damage surfaces - and where repairing is free of consequences,
+    /// since the offsets salvage invalidates are about to be rewritten anyway.
+    /// The damaged bytes are kept at `<shard>.corrupt`; nothing is deleted.
+    ///
+    /// Turn it off to inspect damage yourself (via
+    /// [`scan_zstd_frames`](crate::scan_zstd_frames)) before anything on disk
+    /// moves.
+    pub fn with_auto_repair(mut self, on: bool) -> Self {
+        self.auto_repair = on;
         self
     }
 
@@ -767,8 +845,17 @@ where
         }
 
         for (path, key) in todo {
-            if self.reframe_if_coarse(&path)? {
-                report.reframed += 1;
+            // Only changed shards reach here, so the damage scan is bounded by
+            // what is actually new rather than the whole corpus.
+            if self.repair_if_damaged(&path) {
+                report.repaired += 1;
+            }
+            // A shard that cannot be reframed is still worth indexing, and it
+            // must not take the rest of the pass down with it.
+            match self.reframe_if_coarse(&path) {
+                Ok(true) => report.reframed += 1,
+                Ok(false) => {}
+                Err(e) => warn!("{}: reframe failed: {e}", path.display()),
             }
 
             let shard = shard_hash_of(&path);
@@ -894,6 +981,136 @@ where
         built
     }
 
+    /// Salvage one shard if it is damaged, returning whether it was rewritten.
+    ///
+    /// A no-op (one header walk, no decompression) when the shard is intact,
+    /// so this is cheap enough to sit on the indexing path.
+    #[cfg(feature = "sync")]
+    fn repair_if_damaged(&self, path: &Path) -> bool {
+        if !self.auto_repair {
+            return false;
+        }
+        let is_zstd = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("zst") | Some("zstd")
+        );
+        if !is_zstd {
+            return false; // gz/bz2 have no frame structure to salvage
+        }
+        match repair_archive(path, self.frame_target) {
+            Ok(Some(report)) => {
+                warn!(
+                    "{}: repaired - {} lines ({} bytes) salvaged across {} damage point(s), \
+                     {} bytes dropped; original kept at {}",
+                    path.display(),
+                    report.lines,
+                    report.bytes,
+                    report.scan.damage.len(),
+                    report.dropped,
+                    report
+                        .original
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default(),
+                );
+                self.pool.invalidate(path);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                warn!("{}: repair failed: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// Salvage every damaged shard in the archive directory.
+    ///
+    /// Scans each zstd shard structurally and, where the walk hits corruption,
+    /// rewrites it from the frames that still decode (see [`repair_archive`]).
+    /// Damaged shards keep their original bytes at `<shard>.corrupt`.
+    ///
+    /// **Repair moves events**, so stored offsets for a repaired shard are
+    /// stale: call [`rebuild_index`](Self::rebuild_index) afterwards, or run
+    /// this before indexing.
+    ///
+    /// The shard currently being appended to is locked by the writer and is
+    /// skipped with a warning rather than failing the sweep.
+    pub fn repair_damaged_shards(&self) -> Vec<(PathBuf, RepairReport)> {
+        let entries = match std::fs::read_dir(&self.out_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to list {}: {e}", self.out_dir.display());
+                return Vec::new();
+            }
+        };
+        let mut repaired = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_zstd = matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("zst") | Some("zstd")
+            );
+            if !path.is_file() || !is_zstd {
+                continue;
+            }
+            match repair_archive(&path, self.frame_target) {
+                Ok(Some(report)) => {
+                    warn!(
+                        "{}: repaired - {} lines ({} bytes) salvaged from {} frame(s), \
+                         {} damage point(s), {} bytes dropped; original kept at {}",
+                        path.display(),
+                        report.lines,
+                        report.bytes,
+                        report.scan.offsets.len(),
+                        report.scan.damage.len(),
+                        report.dropped,
+                        report
+                            .original
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                    );
+                    self.pool.invalidate(&path);
+                    repaired.push((path, report));
+                }
+                Ok(None) => {}
+                Err(e) => warn!("{}: repair failed: {e}", path.display()),
+            }
+        }
+        if !repaired.is_empty() {
+            self.pool.clear();
+        }
+        repaired
+    }
+
+    /// Salvage every damaged shard, except the one the writer owns.
+    ///
+    /// Used by the indexing paths, where repairing is safe because everything
+    /// downstream is about to be (re)indexed from the repaired bytes.
+    #[cfg(feature = "sync")]
+    fn repair_damaged_shards_except_live(&self) -> usize {
+        if !self.auto_repair {
+            return 0;
+        }
+        let live = Self::get_archive_path(&self.out_dir, &Utc::now());
+        let entries = match std::fs::read_dir(&self.out_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Failed to list {}: {e}", self.out_dir.display());
+                return 0;
+            }
+        };
+        let mut repaired = 0;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() && path != live && self.repair_if_damaged(&path) {
+                repaired += 1;
+            }
+        }
+        repaired
+    }
+
     /// Rebuilt event id index using parallel std::thread workers.
     ///
     /// This method uses OS threads for true CPU parallelism, which is significantly
@@ -904,6 +1121,14 @@ where
         // archives that are one giant frame (imported from elsewhere) into
         // bounded frames. Reframing preserves decompressed bytes, so the
         // offsets recorded below stay valid.
+        //
+        // The writer has to hand back today's shard before that: reframing a
+        // file it holds open would leave it writing into an unlinked inode.
+        self.release_live_shard();
+        // Salvage damaged shards first. A full rebuild is the one moment this
+        // is free: every offset is being recomputed anyway, so the fact that
+        // repair moves events costs nothing.
+        self.repair_damaged_shards_except_live();
         self.rebuild_missing_frame_indexes();
         for entry in std::fs::read_dir(&self.out_dir)?.flatten() {
             let path = entry.path();
@@ -911,7 +1136,18 @@ where
                 && crate::cursor::is_walkable_archive(&path)
                 && let Err(e) = self.reframe_if_coarse(&path)
             {
+                // Reframing decodes the whole shard, so it is the first thing
+                // to notice damage the structural scan called survivable.
+                // Salvage and retry once before giving up on the shard.
                 warn!("{}: reframe failed: {e}", path.display());
+                if self.repair_if_damaged(&path)
+                    && let Err(e) = self.reframe_if_coarse(&path)
+                {
+                    warn!(
+                        "{}: reframe still failing after repair: {e}",
+                        path.display()
+                    );
+                }
             }
         }
         self.database.wipe()?;

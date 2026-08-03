@@ -303,3 +303,118 @@ fn converting_a_zst_reframes_in_place() {
             > 5
     );
 }
+
+/// Corrupt a block header partway into a framed shard, killing that frame.
+fn damage_frame(path: &Path, nth: usize) {
+    let table = FrameTable::load(&sidecar_path(path)).unwrap().unwrap();
+    let victim = table.get(nth).unwrap().compressed as usize;
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[victim + 6] |= 0b110; // reserved block type
+    std::fs::write(path, &bytes).unwrap();
+    std::fs::remove_file(sidecar_path(path)).unwrap();
+    // Damage keeps the file size, and `ShardState` compares mtime in whole
+    // seconds - so without this the incremental pass rightly calls the shard
+    // unchanged and never looks at it.
+    let f = std::fs::File::options().write(true).open(path).unwrap();
+    f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn incremental_indexing_repairs_a_damaged_shard() {
+    let dir = tmp_dir("repair-incremental");
+    let keys = Keys::generate();
+    let shard = dir.join("events_20190101.jsonl.zst");
+
+    // A framed shard, then bit-rot in the middle of it.
+    let ids = {
+        let db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048).unwrap();
+        let ids = write_import(&shard, &keys, 0..3000);
+        db.index_new_shards().unwrap();
+        ids
+    };
+    let table = FrameTable::load(&sidecar_path(&shard)).unwrap().unwrap();
+    assert!(table.len() > 10);
+    damage_frame(&shard, table.len() / 2);
+
+    let db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048).unwrap();
+    let report = db.index_new_shards().unwrap();
+    assert_eq!(report.repaired, 1, "damage should be salvaged, not skipped");
+
+    // The shard is whole again and the damaged bytes were preserved.
+    let mut corrupt = shard.clone().into_os_string();
+    corrupt.push(".corrupt");
+    assert!(std::fs::metadata(&corrupt).is_ok(), "original must be kept");
+    assert!(zstd::decode_all(std::fs::File::open(&shard).unwrap()).is_ok());
+
+    // Events on both sides of the damage survived and are still O(1).
+    let mut found = 0;
+    for id in [&ids[0], &ids[2999]] {
+        let got = db.event_by_id(id).await.unwrap();
+        assert_eq!(got.map(|e| e.id).as_ref(), Some(id));
+        found += 1;
+    }
+    assert_eq!(found, 2);
+
+    // A second pass finds nothing left to repair.
+    let again = db.index_new_shards().unwrap();
+    assert_eq!(again.repaired, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rebuild_index_repairs_before_indexing() {
+    let dir = tmp_dir("repair-rebuild");
+    let keys = Keys::generate();
+    let shard = dir.join("events_20190102.jsonl.zst");
+
+    let ids = {
+        let mut db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048).unwrap();
+        let ids = write_import(&shard, &keys, 0..3000);
+        db.rebuild_index().unwrap();
+        ids
+    };
+    let table = FrameTable::load(&sidecar_path(&shard)).unwrap().unwrap();
+    damage_frame(&shard, table.len() / 2);
+
+    let mut db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048).unwrap();
+    db.rebuild_index().unwrap();
+
+    // Repaired, re-framed and re-indexed in one pass: lookups work without
+    // any scan fallback, which only holds if offsets match the new bytes.
+    let strict = db
+        .clone()
+        .with_scan_fallback(nostr_archive_cursor::ScanFallback::Off);
+    assert!(strict.locate(&ids[0]).unwrap().is_some());
+    assert!(strict.locate(&ids[2999]).unwrap().is_some());
+    assert_eq!(
+        strict.event_by_id(&ids[2999]).await.unwrap().map(|e| e.id),
+        Some(ids[2999])
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auto_repair_can_be_turned_off() {
+    let dir = tmp_dir("repair-off");
+    let keys = Keys::generate();
+    let shard = dir.join("events_20190103.jsonl.zst");
+
+    {
+        let db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048).unwrap();
+        write_import(&shard, &keys, 0..2000);
+        db.index_new_shards().unwrap();
+    }
+    let table = FrameTable::load(&sidecar_path(&shard)).unwrap().unwrap();
+    damage_frame(&shard, table.len() / 2);
+    let before = std::fs::read(&shard).unwrap();
+
+    let db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 2048)
+        .unwrap()
+        .with_auto_repair(false);
+    let report = db.index_new_shards().unwrap();
+    assert_eq!(report.repaired, 0);
+    assert_eq!(
+        std::fs::read(&shard).unwrap(),
+        before,
+        "opting out must leave the bytes exactly as they were"
+    );
+}

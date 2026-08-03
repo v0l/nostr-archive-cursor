@@ -73,3 +73,7 @@ required-features = ["db-rocksdb", "sync"]
 [[example]]
 name = "compaction_check"
 required-features = ["db-rocksdb", "sync"]
+
+[[example]]
+name = "repair_check"
+required-features = ["db", "sync"]

@@ -273,12 +273,72 @@ impl FrameLog {
     }
 }
 
+/// First four bytes of every zstd data frame.
+pub const ZSTD_MAGIC_BYTES: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// A point where the frame walk could not continue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Damage {
+    /// Start of the frame that failed to parse.
+    pub frame_start: u64,
+    /// Offset the parse gave up at.
+    pub offset: u64,
+    /// Why it gave up (`truncated block body`, `reserved zstd block type`, ...).
+    pub reason: String,
+    /// Offset the scan resynchronised at, or `None` when it ran out of file.
+    pub resync: Option<u64>,
+}
+
+/// Result of walking a possibly damaged archive.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanReport {
+    /// Compressed offset of every frame that parsed cleanly, in file order.
+    pub offsets: Vec<u64>,
+    /// Number of leading offsets that form an unbroken run from byte 0. Frames
+    /// past this point are still readable but no longer describe a contiguous
+    /// decompressed stream, so their uncompressed offsets cannot be trusted.
+    pub clean_prefix: usize,
+    /// Faults, in file order. Empty means the archive is structurally intact.
+    pub damage: Vec<Damage>,
+}
+
+impl ScanReport {
+    pub fn is_clean(&self) -> bool {
+        self.damage.is_empty()
+    }
+}
+
+/// Every offset in the stream that looks like the start of a zstd frame.
+///
+/// Deliberately dumber than [`scan_zstd_frames`], and that is the point: when
+/// two writers interleave, a frame's *headers* can parse cleanly while
+/// describing byte ranges that belong to the other stream, which hides the
+/// real frames living inside them. On one 156 MB shard the structural walk
+/// found 1 frame; the byte search found the frame holding 433 MB of the
+/// events. Only the decoder can settle which candidates are real, so hand it
+/// all of them.
+///
+/// Coincidental 4-byte matches inside compressed data are expected; they
+/// simply fail to decode.
+pub fn scan_zstd_frame_starts<R: Read + Seek>(src: &mut R, len: u64) -> Result<Vec<u64>> {
+    let mut starts = Vec::new();
+    let mut from = 0u64;
+    while let Some(at) = find_frame_magic(src, from, len)? {
+        starts.push(at);
+        from = at + 4;
+    }
+    Ok(starts)
+}
+
 /// Boundaries of every zstd frame in `data`, found by walking frame headers
 /// and block headers - no decompression.
 ///
 /// Used to regenerate a sidecar for a shard written before framing existed
 /// (or imported from elsewhere). Returns the compressed offset of each frame
 /// plus the total compressed length consumed.
+///
+/// Errors on the first structural fault; use [`scan_zstd_frames`] to walk a
+/// damaged archive.
 pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
     scan_zstd_frame_offsets_reader(&mut std::io::Cursor::new(data), data.len() as u64)
 }
@@ -293,21 +353,97 @@ pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
 /// Bounded memory: headers are read a few bytes at a time and block bodies are
 /// seeked over, never read. `len` is the stream's total length, used for the
 /// same truncation checks the buffered scan made against `data.len()`.
+///
+/// Strict: any fault fails the whole scan. [`scan_zstd_frames`] keeps what it
+/// found and reports where the damage is instead.
 pub fn scan_zstd_frame_offsets_reader<R: Read + Seek>(src: &mut R, len: u64) -> Result<Vec<u64>> {
+    let report = scan_zstd_frames(src, len)?;
+    if let Some(d) = report.damage.first() {
+        bail!("{}", d.reason);
+    }
+    Ok(report.offsets)
+}
+
+/// Walk every frame in the archive, surviving damage.
+///
+/// A zstd frame cannot be resynchronised *internally* - one bad block header
+/// and the rest of that frame is gone - but a file is a sequence of frames, so
+/// the next intact frame is recoverable. On a fault the scan hunts forward for
+/// the next frame magic and carries on, recording what it skipped.
+///
+/// This is why a truncated tail (the common crash case) no longer costs the
+/// whole index: the frames before it are still described exactly.
+pub fn scan_zstd_frames<R: Read + Seek>(src: &mut R, len: u64) -> Result<ScanReport> {
+    let mut report = ScanReport::default();
+    let mut pos = 0u64;
+    let mut contiguous = true;
+
+    while pos + 4 <= len {
+        match frame_extent(src, pos, len)? {
+            Extent::Frame(end) => {
+                report.offsets.push(pos);
+                if contiguous {
+                    report.clean_prefix = report.offsets.len();
+                }
+                pos = end;
+            }
+            Extent::Skippable(end) => pos = end, // not a data frame, no boundary
+            Extent::Fault { offset, reason } => {
+                contiguous = false;
+                let resync = find_frame_magic(src, pos + 4, len)?;
+                report.damage.push(Damage {
+                    frame_start: pos,
+                    offset,
+                    reason,
+                    resync,
+                });
+                match resync {
+                    Some(next) => pos = next,
+                    None => break,
+                }
+            }
+        }
+    }
+    Ok(report)
+}
+
+enum Extent {
+    /// Data frame ending at this offset.
+    Frame(u64),
+    /// Skippable frame ending at this offset.
+    Skippable(u64),
+    Fault {
+        offset: u64,
+        reason: String,
+    },
+}
+
+/// Parse the frame starting at `start`, returning where it ends.
+///
+/// Only I/O errors are `Err`; malformed data is [`Extent::Fault`] so the
+/// caller can decide whether to give up or resynchronise.
+fn frame_extent<R: Read + Seek>(src: &mut R, start: u64, len: u64) -> Result<Extent> {
     const ZSTD_MAGIC: u32 = 0xFD2F_B528;
     const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
     const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 
-    src.seek(SeekFrom::Start(0))?;
-    let mut offsets = Vec::new();
-    let mut pos = 0u64;
+    let mut pos = start;
     let mut buf = [0u8; 4];
+    src.seek(SeekFrom::Start(pos))?;
 
+    macro_rules! fault {
+        ($what:expr) => {
+            return Ok(Extent::Fault {
+                offset: pos,
+                reason: $what.to_string(),
+            })
+        };
+    }
     // Read exactly `n` bytes at the cursor, advancing `pos`.
     macro_rules! take {
         ($n:expr, $what:literal) => {{
             if pos + $n as u64 > len {
-                bail!($what);
+                fault!($what);
             }
             src.read_exact(&mut buf[..$n])?;
             pos += $n as u64;
@@ -319,73 +455,117 @@ pub fn scan_zstd_frame_offsets_reader<R: Read + Seek>(src: &mut R, len: u64) -> 
         ($n:expr, $what:literal) => {{
             let n = $n as u64;
             if pos + n > len {
-                bail!($what);
+                fault!(format!("{} (short by {} bytes)", $what, pos + n - len));
             }
             src.seek(SeekFrom::Current(n as i64))?;
             pos += n;
         }};
     }
 
-    while pos + 4 <= len {
-        let frame_start = pos;
-        let magic = u32::from_le_bytes(take!(4, "truncated frame magic").try_into().unwrap());
-        if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
-            let size = u32::from_le_bytes(
-                take!(4, "truncated skippable frame header")
-                    .try_into()
-                    .unwrap(),
-            );
-            skip!(size, "truncated skippable frame body");
-            continue; // not a data frame, no boundary recorded
-        }
-        if magic != ZSTD_MAGIC {
-            bail!("not a zstd frame at offset {frame_start}");
-        }
-
-        // Frame header
-        let fhd = take!(1, "truncated frame header descriptor")[0];
-        let fcs_flag = fhd >> 6;
-        let single_segment = (fhd >> 5) & 1 == 1;
-        let checksum = (fhd >> 2) & 1 == 1;
-        let did_flag = fhd & 3;
-        let mut header_rest = usize::from(!single_segment); // window descriptor
-        header_rest += match did_flag {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            _ => 4,
-        };
-        header_rest += match fcs_flag {
-            0 => usize::from(single_segment),
-            1 => 2,
-            2 => 4,
-            _ => 8,
-        };
-        skip!(header_rest, "truncated frame header");
-
-        // Blocks
-        loop {
-            let hdr = take!(3, "truncated block header");
-            let hdr = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
-            let last = hdr & 1 == 1;
-            let block_type = (hdr >> 1) & 3;
-            let block_size = hdr >> 3;
-            if block_type == 3 {
-                bail!("reserved zstd block type");
-            }
-            // RLE blocks are a single byte on the wire.
-            let body = if block_type == 1 { 1 } else { block_size };
-            skip!(body, "truncated block body");
-            if last {
-                break;
-            }
-        }
-        if checksum {
-            skip!(4u32, "truncated frame checksum");
-        }
-        offsets.push(frame_start);
+    let magic = u32::from_le_bytes(take!(4, "truncated frame magic").try_into().unwrap());
+    if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
+        let size = u32::from_le_bytes(
+            take!(4, "truncated skippable frame header")
+                .try_into()
+                .unwrap(),
+        );
+        skip!(size, "truncated skippable frame body");
+        return Ok(Extent::Skippable(pos));
     }
-    Ok(offsets)
+    if magic != ZSTD_MAGIC {
+        pos = start;
+        fault!(format!("not a zstd frame at offset {start}"));
+    }
+
+    // Frame header
+    let fhd = take!(1, "truncated frame header descriptor")[0];
+    let fcs_flag = fhd >> 6;
+    let single_segment = (fhd >> 5) & 1 == 1;
+    let checksum = (fhd >> 2) & 1 == 1;
+    let did_flag = fhd & 3;
+    let mut header_rest = usize::from(!single_segment); // window descriptor
+    header_rest += match did_flag {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    header_rest += match fcs_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    skip!(header_rest, "truncated frame header");
+
+    // Blocks
+    loop {
+        let hdr = take!(3, "truncated block header");
+        let hdr = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
+        let last = hdr & 1 == 1;
+        let block_type = (hdr >> 1) & 3;
+        let block_size = hdr >> 3;
+        if block_type == 3 {
+            pos -= 3;
+            fault!("reserved zstd block type");
+        }
+        // RLE blocks are a single byte on the wire.
+        let body = if block_type == 1 { 1 } else { block_size };
+        skip!(body, "truncated block body");
+        if last {
+            break;
+        }
+    }
+    if checksum {
+        skip!(4u32, "truncated frame checksum");
+    }
+    Ok(Extent::Frame(pos))
+}
+
+/// Next zstd frame magic at or after `from`, scanned in bounded windows.
+///
+/// A match can be a coincidence inside compressed data; the caller proves it
+/// by parsing the frame there, and comes back for the next candidate if that
+/// fails.
+fn find_frame_magic<R: Read + Seek>(src: &mut R, from: u64, len: u64) -> Result<Option<u64>> {
+    const WINDOW: usize = 256 * 1024;
+    if from + 4 > len {
+        return Ok(None);
+    }
+    let mut pos = from;
+    let mut buf = vec![0u8; WINDOW];
+    src.seek(SeekFrom::Start(pos))?;
+    let mut filled = 0usize;
+    loop {
+        let want = ((len - pos) as usize).min(WINDOW - filled);
+        if want == 0 {
+            return Ok(None);
+        }
+        let mut read = 0usize;
+        while read < want {
+            match src.read(&mut buf[filled + read..filled + want]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if read == 0 {
+            return Ok(None);
+        }
+        let end = filled + read;
+        if let Some(i) = buf[..end]
+            .windows(4)
+            .position(|w| w == ZSTD_MAGIC_BYTES.as_slice())
+        {
+            return Ok(Some(pos - filled as u64 + i as u64));
+        }
+        // Keep the last 3 bytes: a magic can straddle the window edge.
+        let keep = 3.min(end);
+        buf.copy_within(end - keep..end, 0);
+        pos += read as u64;
+        filled = keep;
+    }
 }
 
 #[cfg(test)]

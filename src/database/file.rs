@@ -1,10 +1,10 @@
-use crate::database::frames::{FrameLog, FrameStart, FrameTable, sidecar_path};
+use crate::database::frames::{FrameLog, FrameStart, FrameTable, ScanReport, sidecar_path};
 use crate::database::value::EventLoc;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use log::warn;
 use serde::Serialize;
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zstd::Encoder;
 
@@ -37,6 +37,60 @@ use zstd::Encoder;
 /// each frame once for the whole group - for 19% less disk than 32 KiB.
 /// Lower it if interactive single-id fetches dominate.
 pub const DEFAULT_FRAME_TARGET: u64 = 512 * 1024;
+
+/// Take an advisory exclusive lock on a shard.
+///
+/// Two writers on one shard is *the* way to corrupt an archive, and it does
+/// not look like corruption while it happens: both open with `O_APPEND`, both
+/// write valid zstd, and the kernel interleaves their chunks at EOF. The file
+/// then contains two shuffled streams - each frame's block headers describe
+/// byte ranges that now belong to the other writer, so the walk derails and
+/// every decode stops a few MB in. Nothing reports an error at write time.
+///
+/// The lock is per open file handle (`flock` on unix, `LockFileEx` on
+/// Windows), so it also catches a second `CompressedJsonLFile` inside the
+/// *same* process - the case a `fcntl` record lock would happily allow. It is
+/// advisory: readers and external tools are unaffected.
+///
+/// The lock lives as long as the handle, i.e. until the writer is dropped, and
+/// is released by the kernel if the process dies - no stale lock files to
+/// clean up after a crash.
+fn lock_shard_exclusive(file: &File, path: &Path) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "{}: already open by another archive writer; refusing to append \
+             (concurrent writers interleave zstd frames and corrupt the shard)",
+            path.display()
+        ),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("{}: locking shard", path.display()))
+        }
+    }
+}
+
+/// Hold an advisory lock on a shard while rewriting it.
+///
+/// Repair, reframe and convert all rename a new file into place. Doing that
+/// under a live writer silently orphans it: its descriptor still points at the
+/// unlinked inode, so everything it writes afterwards lands nowhere.
+fn lock_shard_standalone(path: &Path) -> Result<File> {
+    let file = File::options().read(true).open(path)?;
+    lock_shard_exclusive(&file, path)?;
+    Ok(file)
+}
+
+/// Open a zstd encoder with a frame checksum.
+///
+/// The 4-byte trailer costs nothing measurable per 512 KiB frame and turns
+/// silent corruption into a decode error attributed to the *frame that owns
+/// it*, which is what makes [`repair_archive`] able to say which events are
+/// suspect instead of guessing.
+fn new_encoder(file: File, level: i32) -> Result<Encoder<'static, File>> {
+    let mut enc = Encoder::new(file, level)?;
+    enc.include_checksum(true)?;
+    Ok(enc)
+}
 
 /// A ZSTD compressed JSON-L appender that reports where each event landed.
 ///
@@ -71,6 +125,7 @@ impl CompressedJsonLFile {
         let path = path.as_ref().to_path_buf();
         let level = 3;
         let mut file = File::options().create(true).append(true).open(&path)?;
+        lock_shard_exclusive(&file, &path)?;
         let compressed_len = file.seek(SeekFrom::End(0))?;
 
         // Resume: work out the decompressed length already in the file so new
@@ -85,7 +140,7 @@ impl CompressedJsonLFile {
         })?;
 
         Ok(Self {
-            stream: Some(Encoder::new(file, level)?),
+            stream: Some(new_encoder(file, level)?),
             frames,
             path,
             level,
@@ -187,7 +242,7 @@ impl CompressedJsonLFile {
         })?;
         self.frame_compressed_start = compressed;
         self.frame_uncompressed_start = self.uncompressed_pos;
-        self.stream = Some(Encoder::new(file, self.level)?);
+        self.stream = Some(new_encoder(file, self.level)?);
         Ok(())
     }
 
@@ -261,7 +316,32 @@ pub fn rebuild_frame_index(path: &Path) -> Result<usize> {
     // Streamed, not slurped: a shard can be larger than RAM, and both this scan
     // and the per-frame decode below only ever move forward.
     let mut src = BufReader::new(file);
-    let offsets = crate::database::frames::scan_zstd_frame_offsets_reader(&mut src, len)?;
+    let report = crate::database::frames::scan_zstd_frames(&mut src, len)?;
+
+    // Damage means the decompressed stream is no longer contiguous, so offsets
+    // past the first fault would be lies. Index the clean prefix - which for a
+    // truncated tail, the usual crash, is the entire useful file - and say so.
+    // `repair_archive` is the way to get the rest back.
+    // The last indexed frame ends where the damage starts, not at EOF: the
+    // bytes after it are a half-written frame, and decoding into them to
+    // measure the good frame would fail the whole rebuild.
+    let usable_end = report.damage.first().map(|d| d.frame_start).unwrap_or(len);
+    let usable = if report.is_clean() {
+        report.offsets.len()
+    } else {
+        let d = &report.damage[0];
+        warn!(
+            "{}: damaged at offset {} ({}); indexing the {} clean frame(s) before it, \
+             {} recoverable frame(s) after it need `repair_archive`",
+            path.display(),
+            d.offset,
+            d.reason,
+            report.clean_prefix,
+            report.offsets.len() - report.clean_prefix,
+        );
+        report.clean_prefix
+    };
+    let offsets = &report.offsets[..usable];
 
     // Write to a temp path then rename, so a crash can't leave a sidecar that
     // disagrees with the shard.
@@ -277,7 +357,7 @@ pub fn rebuild_frame_index(path: &Path) -> Result<usize> {
             uncompressed,
             compressed: start,
         })?;
-        let end = offsets.get(i + 1).copied().unwrap_or(len);
+        let end = offsets.get(i + 1).copied().unwrap_or(usable_end);
         src.seek(SeekFrom::Start(start))?;
         let mut frame = (&mut src).take(end - start);
         let mut decoder = zstd::stream::Decoder::new(&mut frame)?;
@@ -286,6 +366,304 @@ pub fn rebuild_frame_index(path: &Path) -> Result<usize> {
     drop(log);
     std::fs::rename(&tmp, &final_path)?;
     Ok(offsets.len())
+}
+
+/// What [`repair_archive`] managed to save.
+#[derive(Debug, Clone, Default)]
+pub struct RepairReport {
+    /// Structural scan the repair was based on.
+    pub scan: ScanReport,
+    /// Complete JSON lines written to the repaired archive.
+    pub lines: u64,
+    /// Decompressed bytes written.
+    pub bytes: u64,
+    /// Decompressed bytes dropped as an incomplete trailing line at a fault.
+    pub dropped: u64,
+    /// Where the damaged original was moved, when it was replaced.
+    pub original: Option<PathBuf>,
+}
+
+/// Salvage a damaged zstd archive into a clean, framed one.
+///
+/// A corrupt block header destroys the *remainder of its frame* - zstd has no
+/// intra-frame resync - but the frames after it are independent and usually
+/// fine. This walks every frame the scanner can find, decodes each as far as
+/// it goes, keeps only whole JSON lines, and rewrites the survivors as a
+/// normal bounded-frame archive with a matching sidecar.
+///
+/// **Offsets change.** Salvage drops the unreadable regions, so decompressed
+/// positions shift and any existing index entries for this shard are stale -
+/// re-index the shard afterwards. Event *ids* are unaffected, so re-indexing
+/// simply re-records them.
+///
+/// The damaged file is kept as `<path>.corrupt` rather than deleted; nothing
+/// here is clever enough to be trusted with the only copy.
+///
+/// Returns `Ok(None)` when the archive is structurally intact (nothing to do).
+pub fn repair_archive(path: &Path, frame_target: u64) -> Result<Option<RepairReport>> {
+    // Held until the swap is done: see `lock_shard_standalone`.
+    let lock = lock_shard_standalone(path)?;
+    let len = lock.metadata()?.len();
+    if len == 0 {
+        return Ok(None);
+    }
+    let report = {
+        let mut src = BufReader::new(File::open(path)?);
+        crate::database::frames::scan_zstd_frames(&mut src, len)?
+    };
+    if report.is_clean() {
+        return Ok(None);
+    }
+    for d in &report.damage {
+        warn!(
+            "{}: damage at offset {} ({}), resync at {}",
+            path.display(),
+            d.offset,
+            d.reason,
+            d.resync
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "end of file".into()),
+        );
+    }
+
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".repair.tmp");
+    let tmp = PathBuf::from(tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(sidecar_path(&tmp));
+
+    let starts = {
+        let mut src = BufReader::new(File::open(path)?);
+        crate::database::frames::scan_zstd_frame_starts(&mut src, len)?
+    };
+    let mut salvage = SalvageReader::open(path, starts, len)?;
+    write_framed(&mut salvage, &tmp, frame_target)?;
+    let (lines, bytes, dropped) = salvage.stats();
+
+    let mut corrupt = path.as_os_str().to_os_string();
+    corrupt.push(".corrupt");
+    let corrupt = PathBuf::from(corrupt);
+    std::fs::rename(path, &corrupt)?;
+    let _ = std::fs::remove_file(sidecar_path(path));
+    std::fs::rename(sidecar_path(&tmp), sidecar_path(path))?;
+    std::fs::rename(&tmp, path)?;
+    drop(lock);
+
+    Ok(Some(RepairReport {
+        scan: report,
+        lines,
+        bytes,
+        dropped,
+        original: Some(corrupt),
+    }))
+}
+
+/// Counts the compressed bytes a decoder actually *consumes*, so salvage knows
+/// exactly how far into the file a frame reached.
+///
+/// Counting `read` calls instead would count the buffer's read-ahead too, and
+/// overshoot by up to a buffer - enough to skip the next real frame. `consume`
+/// is the decoder saying "I used these bytes", which is the number we want.
+struct Counted {
+    inner: BufReader<File>,
+    consumed: u64,
+}
+
+impl Read for Counted {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = {
+            let src = self.fill_buf()?;
+            let n = src.len().min(buf.len());
+            buf[..n].copy_from_slice(&src[..n]);
+            n
+        };
+        self.consume(n);
+        Ok(n)
+    }
+}
+
+impl std::io::BufRead for Counted {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.consumed += amt as u64;
+        self.inner.consume(amt);
+    }
+}
+
+/// Reader over the salvageable content of a damaged archive, emitting only
+/// whole JSON lines.
+///
+/// Each candidate frame is decoded as far as zstd will go - to the end of the
+/// file if the frame is healthy, to the corruption otherwise. Both ends of
+/// every region are trimmed to line boundaries:
+///
+/// * the **tail**, because damage cuts the last line in half;
+/// * the **head**, because a frame boundary is a *byte* boundary - a frame
+///   picked up after a resync almost always starts mid-event.
+///
+/// Missing the head trim is silent: the archive still passes `zstd -t`, and
+/// the fragment only surfaces later as an indexer that stops at that line and
+/// drops the rest of the shard.
+///
+/// Lines that are not a JSON object are dropped too, which is what keeps a
+/// coincidental frame magic - decoding to plausible-looking noise - from
+/// putting garbage in the repaired archive.
+///
+/// Candidates that start inside a region an earlier decode already covered are
+/// skipped: that both avoids re-emitting the same events and keeps the work
+/// near one pass over the file instead of one pass per candidate.
+struct SalvageReader {
+    starts: std::vec::IntoIter<u64>,
+    len: u64,
+    /// Compressed offset the last successful decode reached.
+    covered_to: u64,
+    decoder: Option<zstd::stream::Decoder<'static, Counted>>,
+    /// Where the frame being decoded starts.
+    frame_start: u64,
+    path: PathBuf,
+    /// Whole lines waiting to be read out.
+    ready: Vec<u8>,
+    ready_pos: usize,
+    /// Output after the last newline seen in the current frame.
+    held: Vec<u8>,
+    /// Waiting to drop this region's leading partial line.
+    skip_head: bool,
+    scratch: Vec<u8>,
+    lines: u64,
+    bytes: u64,
+    dropped: u64,
+}
+
+impl SalvageReader {
+    fn open(path: &Path, starts: Vec<u64>, len: u64) -> Result<Self> {
+        Ok(Self {
+            starts: starts.into_iter(),
+            len,
+            covered_to: 0,
+            decoder: None,
+            frame_start: 0,
+            path: path.to_path_buf(),
+            ready: Vec::new(),
+            ready_pos: 0,
+            held: Vec::new(),
+            skip_head: false,
+            scratch: vec![0u8; 256 * 1024],
+            lines: 0,
+            bytes: 0,
+            dropped: 0,
+        })
+    }
+
+    /// Queue the whole lines in `held`, keeping only JSON objects.
+    fn emit_lines(&mut self, cut: usize) {
+        let chunk: Vec<u8> = self.held.drain(..=cut).collect();
+        for line in chunk.split_inclusive(|&b| b == b'\n') {
+            let body = line.strip_suffix(b"\n").unwrap_or(line).trim_ascii();
+            if body.first() == Some(&b'{') && body.last() == Some(&b'}') {
+                self.ready.extend_from_slice(line);
+                self.lines += 1;
+            } else {
+                self.dropped += line.len() as u64;
+            }
+        }
+    }
+
+    fn stats(&self) -> (u64, u64, u64) {
+        (self.lines, self.bytes, self.dropped)
+    }
+
+    /// Finish with the current frame, discarding any half-line it ended on and
+    /// recording how far it got.
+    fn end_frame(&mut self) {
+        if let Some(d) = self.decoder.take() {
+            let consumed = d.finish().consumed;
+            self.covered_to = self.covered_to.max(self.frame_start + consumed);
+        }
+        self.dropped += self.held.len() as u64;
+        self.held.clear();
+    }
+}
+
+impl Read for SalvageReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.ready_pos < self.ready.len() {
+                let n = (self.ready.len() - self.ready_pos).min(out.len());
+                out[..n].copy_from_slice(&self.ready[self.ready_pos..self.ready_pos + n]);
+                self.ready_pos += n;
+                self.bytes += n as u64;
+                return Ok(n);
+            }
+            self.ready.clear();
+            self.ready_pos = 0;
+
+            if self.decoder.is_none() {
+                let start = loop {
+                    let Some(start) = self.starts.next() else {
+                        return Ok(0);
+                    };
+                    if start >= self.covered_to && start < self.len {
+                        break start;
+                    }
+                };
+                let mut f = File::open(&self.path)?;
+                f.seek(SeekFrom::Start(start))?;
+                self.frame_start = start;
+                // Only a frame at byte 0 is guaranteed to begin an event.
+                self.skip_head = start != 0;
+                let counted = Counted {
+                    inner: BufReader::new(f),
+                    consumed: 0,
+                };
+                match zstd::stream::Decoder::with_buffer(counted) {
+                    Ok(d) => self.decoder = Some(d),
+                    // Not a frame after all (coincidental magic).
+                    Err(_) => continue,
+                }
+            }
+
+            let decoder = self.decoder.as_mut().expect("decoder present");
+            match decoder.read(&mut self.scratch) {
+                Ok(0) => {
+                    self.end_frame();
+                    continue;
+                }
+                Err(e) => {
+                    // Expected at every damage point: keep what decoded.
+                    warn!(
+                        "{}: frame at {} ended early: {e}",
+                        self.path.display(),
+                        self.frame_start
+                    );
+                    self.end_frame();
+                    continue;
+                }
+                Ok(n) => {
+                    self.held.extend_from_slice(&self.scratch[..n]);
+                    if self.skip_head {
+                        // Everything up to the first newline belongs to an
+                        // event whose start went with the previous frame.
+                        match self.held.iter().position(|&b| b == b'\n') {
+                            Some(nl) => {
+                                self.dropped += nl as u64 + 1;
+                                self.held.drain(..=nl);
+                                self.skip_head = false;
+                            }
+                            None => continue,
+                        }
+                    }
+                    match self.held.iter().rposition(|&b| b == b'\n') {
+                        Some(cut) => self.emit_lines(cut),
+                        // No line boundary yet - keep buffering.
+                        None => continue,
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Convert any supported archive (`.gz`, `.bz2`, plain `.jsonl`, or a
@@ -351,7 +729,16 @@ pub fn convert_archive_to_zst(path: &Path, frame_target: u64) -> Result<PathBuf>
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(sidecar_path(&tmp));
 
-    write_framed(&mut src, &tmp, frame_target)?;
+    let (_, truncated) = write_framed(&mut src, &tmp, frame_target)?;
+    if truncated {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(sidecar_path(&tmp));
+        bail!(
+            "{}: source is damaged and decoded only partially; \
+             repair it first rather than converting away the rest",
+            path.display()
+        );
+    }
 
     std::fs::rename(sidecar_path(&tmp), sidecar_path(&out_path))?;
     std::fs::rename(&tmp, &out_path)?;
@@ -360,8 +747,14 @@ pub fn convert_archive_to_zst(path: &Path, frame_target: u64) -> Result<PathBuf>
 
 /// Stream `src` into `dst` as concatenated zstd frames of at most
 /// `frame_target` uncompressed bytes each, recording every boundary in
-/// `dst`'s sidecar. Shared by conversion and reframing.
-fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usize> {
+/// `dst`'s sidecar. Shared by conversion, reframing and repair.
+///
+/// Returns the frame count and whether the source ended early - a decode error
+/// partway through, i.e. the input is damaged and `dst` holds only its
+/// readable prefix. Callers that rename `dst` over the original **must** check
+/// that flag: doing the rename anyway turns "damaged shard" into "deleted
+/// events".
+fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<(usize, bool)> {
     let frame_target = frame_target.max(1);
     let level = 3;
     let mut out = Some(File::create(dst)?);
@@ -372,6 +765,7 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usi
     let mut uncompressed = 0u64;
     let mut frames = 0usize;
     let mut frame_bytes = 0u64;
+    let mut truncated = false;
 
     loop {
         let read = match src.read(&mut buf) {
@@ -380,6 +774,7 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usi
             Err(e) => {
                 // Truncated or still-open final frame: keep what decoded.
                 warn!("{}: stopping at {uncompressed} bytes: {e}", dst.display());
+                truncated = true;
                 break;
             }
         };
@@ -394,7 +789,7 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usi
                 })?;
                 frames += 1;
                 frame_bytes = 0;
-                encoder = Some(Encoder::new(file, level)?);
+                encoder = Some(new_encoder(file, level)?);
             }
             let room = (frame_target - frame_bytes) as usize;
             let take = room.min(read - written);
@@ -415,7 +810,7 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usi
         file.flush()?;
     }
     drop(log);
-    Ok(frames)
+    Ok((frames, truncated))
 }
 
 /// Rewrite a zstd archive into bounded frames, so lookups into it can seek.
@@ -431,6 +826,7 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<usi
 /// Only `.zst` archives are handled: converting `.gz`/`.bz2` would change the
 /// file name, and the shard id is derived from that name.
 pub fn reframe_archive(path: &Path, frame_target: u64) -> Result<usize> {
+    let lock = lock_shard_standalone(path)?;
     let mut tmp = path.as_os_str().to_os_string();
     tmp.push(".reframe.tmp");
     let tmp = PathBuf::from(tmp);
@@ -438,10 +834,23 @@ pub fn reframe_archive(path: &Path, frame_target: u64) -> Result<usize> {
     let _ = std::fs::remove_file(sidecar_path(&tmp));
 
     let mut src = zstd::stream::Decoder::new(File::open(path)?)?;
-    let frames = write_framed(&mut src, &tmp, frame_target)?;
+    let (frames, truncated) = write_framed(&mut src, &tmp, frame_target)?;
+    // Renaming a partial decode over the original would silently delete every
+    // event after the damage. Leave the shard alone; `repair_archive` is the
+    // path that handles this, and it keeps the original.
+    if truncated {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(sidecar_path(&tmp));
+        bail!(
+            "{}: damaged, decoded only {frames} frame(s) before failing; \
+             repair it instead of reframing",
+            path.display()
+        );
+    }
 
     std::fs::rename(sidecar_path(&tmp), sidecar_path(path))?;
     std::fs::rename(&tmp, path)?;
+    drop(lock);
     Ok(frames)
 }
 
@@ -626,5 +1035,193 @@ mod tests {
         let rebuilt = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
         assert_eq!(n, rebuilt.len());
         assert_eq!(original.starts(), rebuilt.starts());
+    }
+
+    /// A multi-frame archive plus the events it holds.
+    fn write_shard(path: &Path, count: u64, frame_target: u64) -> Vec<u64> {
+        let mut w = CompressedJsonLFile::with_frame_target(path, frame_target).unwrap();
+        for n in 0..count {
+            w.write_event(&ev(n)).unwrap();
+        }
+        w.finish().unwrap();
+        (0..count).collect()
+    }
+
+    fn events_in(path: &Path) -> Vec<u64> {
+        decode_all(path)
+            .split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .filter_map(|l| serde_json::from_slice::<serde_json::Value>(l).ok())
+            .filter_map(|v| v["n"].as_u64())
+            .collect()
+    }
+
+    #[test]
+    fn a_truncated_tail_still_indexes_its_clean_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 400, 1024);
+        let whole = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        assert!(whole.len() > 5);
+
+        // Kill the process mid-frame: lose the last frame's tail.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let last = whole.last().unwrap().compressed;
+        let cut = last + (len - last) / 2;
+        let file = File::options().write(true).open(&path).unwrap();
+        file.set_len(cut).unwrap();
+        drop(file);
+        std::fs::remove_file(sidecar_path(&path)).unwrap();
+
+        // The strict scan gives up on the whole file...
+        let mut src = BufReader::new(File::open(&path).unwrap());
+        assert!(crate::database::frames::scan_zstd_frame_offsets_reader(&mut src, cut).is_err());
+
+        // ...but the index keeps every frame before the damage.
+        let n = rebuild_frame_index(&path).unwrap();
+        assert_eq!(n, whole.len() - 1, "all frames but the truncated one");
+        let rebuilt = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        assert_eq!(rebuilt.starts(), whole.starts()[..n]);
+    }
+
+    #[test]
+    fn repair_salvages_frames_around_the_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 600, 1024);
+        let table = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        assert!(table.len() > 10);
+
+        // Corrupt a block header in the middle: that frame dies, the rest live.
+        let victim = table.get(table.len() / 2).unwrap().compressed;
+        let mut bytes = std::fs::read(&path).unwrap();
+        let hdr = victim as usize + 6;
+        bytes[hdr] |= 0b110; // block type 3 (reserved)
+        std::fs::write(&path, &bytes).unwrap();
+
+        let report = repair_archive(&path, 1024).unwrap().expect("damage found");
+        assert!(!report.scan.damage.is_empty());
+        assert!(report.lines > 0);
+        assert!(
+            std::fs::metadata(report.original.as_ref().unwrap()).is_ok(),
+            "original must be kept"
+        );
+
+        // The repaired shard is clean, seekable and holds the survivors.
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut src = BufReader::new(File::open(&path).unwrap());
+        assert!(
+            crate::database::frames::scan_zstd_frames(&mut src, len)
+                .unwrap()
+                .is_clean()
+        );
+        let survivors = events_in(&path);
+        assert_eq!(survivors.len() as u64, report.lines);
+        assert!(
+            survivors.contains(&0) && survivors.contains(&599),
+            "frames on both sides of the damage must survive"
+        );
+        assert!(
+            survivors.len() < 600,
+            "the damaged frame's events are genuinely gone"
+        );
+        // Every salvaged line is a whole event, never half of one.
+        assert!(survivors.windows(2).all(|w| w[0] < w[1]), "order preserved");
+
+        // A clean archive reports nothing to do.
+        assert!(repair_archive(&path, 1024).unwrap().is_none());
+    }
+
+    #[test]
+    fn repaired_shard_is_seekable_by_the_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 400, 1024);
+        let table = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let hdr = table.get(table.len() / 2).unwrap().compressed as usize + 6;
+        bytes[hdr] |= 0b110;
+        std::fs::write(&path, &bytes).unwrap();
+        repair_archive(&path, 1024).unwrap().unwrap();
+
+        // Offsets moved, so read positions come from the fresh sidecar + data.
+        let data = decode_all(&path);
+        let pool = crate::ShardReaderPool::new();
+        let mut offset = 0u64;
+        for line in data.split_inclusive(|&b| b == b'\n') {
+            let len = (line.len() - 1) as u32;
+            let got = pool.read_zstd_range(&path, offset, len).unwrap();
+            assert_eq!(got, &line[..line.len() - 1], "seek at {offset}");
+            offset += line.len() as u64;
+        }
+    }
+
+    #[test]
+    fn a_second_writer_is_refused_instead_of_corrupting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        let mut first = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        first.write_event(&ev(0)).unwrap();
+        first.flush().unwrap();
+
+        let err = match CompressedJsonLFile::with_frame_target(&path, 1024) {
+            Err(e) => e,
+            Ok(_) => panic!("a second writer must not be allowed to interleave frames"),
+        };
+        assert!(err.to_string().contains("another archive writer"), "{err}");
+
+        // Releasing the first hands the shard over cleanly.
+        first.finish().unwrap();
+        let mut second = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        second.write_event(&ev(1)).unwrap();
+        second.finish().unwrap();
+        assert_eq!(events_in(&path), vec![0, 1]);
+    }
+
+    #[test]
+    fn reframing_a_damaged_shard_refuses_instead_of_truncating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 600, 1024);
+        let table = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        let hdr = table.get(table.len() / 2).unwrap().compressed as usize + 6;
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[hdr] |= 0b110;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Reframing decodes until the damage. Writing that prefix over the
+        // original would delete every event after it.
+        assert!(reframe_archive(&path, 4096).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "shard must be untouched"
+        );
+
+        // Repair is the path that handles damage, and it keeps the original.
+        let report = repair_archive(&path, 1024).unwrap().unwrap();
+        let survivors = events_in(&path);
+        assert_eq!(survivors.len() as u64, report.lines);
+        assert!(survivors.contains(&599), "events past the damage survive");
+    }
+
+    #[test]
+    fn maintenance_refuses_to_swap_a_live_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        let mut w = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        for n in 0..200u64 {
+            w.write_event(&ev(n)).unwrap();
+        }
+        w.flush().unwrap();
+
+        assert!(
+            reframe_archive(&path, 4096).is_err(),
+            "reframing under a live writer would orphan its descriptor"
+        );
+        assert!(repair_archive(&path, 4096).is_err());
+
+        w.finish().unwrap();
+        assert!(reframe_archive(&path, 4096).is_ok());
     }
 }
