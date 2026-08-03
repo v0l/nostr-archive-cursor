@@ -1,8 +1,8 @@
 #![cfg(feature = "db-rocksdb")]
-use crate::database::value::{IndexEntry, V0_LEN};
 use crate::IndexDb;
-use anyhow::anyhow;
+use crate::database::value::{IndexEntry, V0_LEN};
 use anyhow::Result;
+use anyhow::anyhow;
 use log::{debug, warn};
 use rocksdb::properties::{
     BLOCK_CACHE_CAPACITY, BLOCK_CACHE_PINNED_USAGE, BLOCK_CACHE_USAGE, CUR_SIZE_ACTIVE_MEM_TABLE,
@@ -214,7 +214,8 @@ impl RocksDbIndex {
         let expected = cached.saturating_mul(2).saturating_add(2);
         let diff = estimate.abs_diff(expected);
 
-        let diverged = diff > ABS_THRESHOLD && (diff as f64) > REL_THRESHOLD * (estimate.max(1) as f64);
+        let diverged =
+            diff > ABS_THRESHOLD && (diff as f64) > REL_THRESHOLD * (estimate.max(1) as f64);
 
         if diverged {
             warn!(

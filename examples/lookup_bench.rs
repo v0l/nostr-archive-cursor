@@ -23,12 +23,18 @@ async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = std::env::args().skip(1);
     let count: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(100_000);
-    let frame_target: u64 = args.next().and_then(|a| a.parse().ok()).unwrap_or(64 * 1024);
+    let frame_target: u64 = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(64 * 1024);
 
     let dir = std::env::temp_dir().join(format!("nac-bench-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir)?;
-    println!("archive: {} ({count} events, {frame_target} B frames)", dir.display());
+    println!(
+        "archive: {} ({count} events, {frame_target} B frames)",
+        dir.display()
+    );
 
     let db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, frame_target)?;
     let keys = Keys::generate();
@@ -37,9 +43,12 @@ async fn main() -> anyhow::Result<()> {
     let t0 = Instant::now();
     let mut ids = Vec::with_capacity(count as usize);
     for i in 0..count {
-        let ev = EventBuilder::new(Kind::TextNote, format!("bench event {i} {}", "x".repeat(180)))
-            .custom_created_at(Timestamp::from_secs(1_700_000_000 + i))
-            .sign_with_keys(&keys)?;
+        let ev = EventBuilder::new(
+            Kind::TextNote,
+            format!("bench event {i} {}", "x".repeat(180)),
+        )
+        .custom_created_at(Timestamp::from_secs(1_700_000_000 + i))
+        .sign_with_keys(&keys)?;
         ids.push(ev.id);
         db.save_event(&ev).await?;
     }
@@ -59,9 +68,7 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // --- random single lookups ---
-    let sample: Vec<EventId> = (0..1000)
-        .map(|i| ids[(i * 7919) % ids.len()])
-        .collect();
+    let sample: Vec<EventId> = (0..1000).map(|i| ids[(i * 7919) % ids.len()]).collect();
 
     let mut lat = Vec::with_capacity(sample.len());
     for id in &sample {

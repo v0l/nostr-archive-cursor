@@ -82,7 +82,10 @@ async fn meta_count_persists_across_reopen() {
     // Reopen: count should come from the meta key (O(1), no full scan) and be exactly 25
     let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
     assert_eq!(db2.count_keys(), 25, "count should persist across reopen");
-    assert!(!db2.is_index_empty(), "index should not be empty after reopen");
+    assert!(
+        !db2.is_index_empty(),
+        "index should not be empty after reopen"
+    );
 
     drop(db2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -117,7 +120,11 @@ async fn wipe_clears_index_and_count() {
     drop(db);
     tokio::time::sleep(Duration::from_millis(200)).await;
     let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
-    assert_eq!(db2.count_keys(), 0, "wiped count should persist across reopen");
+    assert_eq!(
+        db2.count_keys(),
+        0,
+        "wiped count should persist across reopen"
+    );
 
     drop(db2);
     let _ = std::fs::remove_dir_all(&dir);
@@ -152,7 +159,11 @@ async fn repair_count_fixes_stale_meta() {
 
     // Reopen: it trusts the (wrong) persisted 0 -> thinks index is empty
     let db2 = DefaultJsonFilesDatabase::new(&dir).unwrap();
-    assert_eq!(db2.count_keys(), 0, "stale meta count should be trusted on open");
+    assert_eq!(
+        db2.count_keys(),
+        0,
+        "stale meta count should be trusted on open"
+    );
     assert!(db2.is_index_empty(), "stale meta makes index look empty");
 
     // Repair: rescan must find the real 30 keys, fix the atomic + persisted value

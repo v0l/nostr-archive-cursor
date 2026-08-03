@@ -2,9 +2,7 @@
 //! Opening an archive written by the *previous* version: v0 (8-byte) index
 //! values, uncompressed SSTs, single-frame shards and no frame sidecars.
 
-use nostr_archive_cursor::{
-    DefaultJsonFilesDatabase, FrameTable, ScanFallback, sidecar_path,
-};
+use nostr_archive_cursor::{DefaultJsonFilesDatabase, FrameTable, ScanFallback, sidecar_path};
 use nostr_sdk::prelude::*;
 use std::path::PathBuf;
 
@@ -169,7 +167,10 @@ async fn indexing_upgrades_old_entries_to_located_lookups() {
         "events_{}.jsonl.zst",
         chrono::Utc::now().format("%Y%m%d")
     ));
-    assert!(!sidecar_path(&day_shard).exists(), "old archives have no sidecar");
+    assert!(
+        !sidecar_path(&day_shard).exists(),
+        "old archives have no sidecar"
+    );
 
     let mut db = DefaultJsonFilesDatabase::new_with_frame_target(&dir, 8192).unwrap();
     // A full reindex is what migrates v0 -> v1 (the incremental pass skips the
@@ -177,13 +178,23 @@ async fn indexing_upgrades_old_entries_to_located_lookups() {
     db.rebuild_index().unwrap();
 
     assert_eq!(db.count_keys(), 400);
-    let table = FrameTable::load(&sidecar_path(&day_shard)).unwrap().unwrap();
-    assert!(table.len() > 5, "shard should now be seekable: {} frames", table.len());
+    let table = FrameTable::load(&sidecar_path(&day_shard))
+        .unwrap()
+        .unwrap();
+    assert!(
+        table.len() > 5,
+        "shard should now be seekable: {} frames",
+        table.len()
+    );
 
     // Every event is now located, so lookups need no scanning at all.
     let strict = db.clone().with_scan_fallback(ScanFallback::Off);
     for ev in &events {
-        assert!(strict.locate(&ev.id).unwrap().is_some(), "{} not migrated", ev.id);
+        assert!(
+            strict.locate(&ev.id).unwrap().is_some(),
+            "{} not migrated",
+            ev.id
+        );
         let got = strict.event_by_id(&ev.id).await.unwrap();
         assert_eq!(got.map(|e| e.id).as_ref(), Some(&ev.id));
     }

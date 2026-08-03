@@ -18,9 +18,9 @@ pub mod frames;
 pub use frames::{FrameSpan, FrameStart, FrameTable, sidecar_path};
 mod pool;
 mod value;
+pub use file::*;
 pub use pool::*;
 pub use value::*;
-pub use file::*;
 mod rocksdb;
 #[cfg(feature = "db-rocksdb")]
 pub use crate::database::rocksdb::*;
@@ -373,11 +373,7 @@ where
     /// size. Smaller frames make point lookups faster (a lookup decodes from
     /// the frame start) at negligible cost in compression - see
     /// [`DEFAULT_FRAME_TARGET`].
-    pub fn new_with_index_and_frame_target<P>(
-        dir: P,
-        index: D,
-        frame_target: u64,
-    ) -> Result<Self>
+    pub fn new_with_index_and_frame_target<P>(dir: P, index: D, frame_target: u64) -> Result<Self>
     where
         for<'a> PathBuf: From<&'a P>,
     {
@@ -451,7 +447,10 @@ where
                         warn!("Failed to flush archive: {e}");
                     }
                     let ids: Vec<[u8; 32]> = batch.iter().map(|(k, _)| *k).collect();
-                    if let Err(e) = index_writer.insert_batch(std::mem::take(&mut batch)).map(|_| ()) {
+                    if let Err(e) = index_writer
+                        .insert_batch(std::mem::take(&mut batch))
+                        .map(|_| ())
+                    {
                         warn!("Failed to apply index update: {e}");
                     }
                     for id in ids {
@@ -513,9 +512,7 @@ where
         self.database
             .list_ids(since, until)
             .into_iter()
-            .filter_map(|(k, v)| {
-                Some((EventId::from_slice(&k).ok()?, Timestamp::from_secs(v)))
-            })
+            .filter_map(|(k, v)| Some((EventId::from_slice(&k).ok()?, Timestamp::from_secs(v))))
             .collect()
     }
 
@@ -586,10 +583,7 @@ where
         let mut fallback = Vec::new();
         for (i, entry) in entries.iter().enumerate() {
             match entry {
-                Some(IndexEntry {
-                    loc: Some(loc),
-                    ..
-                }) => match self.shard_path(loc.shard) {
+                Some(IndexEntry { loc: Some(loc), .. }) => match self.shard_path(loc.shard) {
                     Some(path) => {
                         slots.push(i);
                         requests.push(ReadRequest {

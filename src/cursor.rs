@@ -713,7 +713,10 @@ impl NostrCursor {
 
         // Explicit file list, or everything in the directory.
         let files: Vec<PathBuf> = match self.only {
-            Some(files) => files.into_iter().filter(|p| is_walkable_archive(p)).collect(),
+            Some(files) => files
+                .into_iter()
+                .filter(|p| is_walkable_archive(p))
+                .collect(),
             None => match std::fs::read_dir(&dir) {
                 Ok(reader) => reader
                     .filter_map(|e| e.ok())
@@ -768,7 +771,9 @@ impl NostrCursor {
                                 None => break, // No more files
                             };
 
-                            let current = processed_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            let current = processed_count
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                                + 1;
                             log::info!("Reading [{}/{}]: {}", current, total_files, path.display());
                             Self::read_file_sync_chunked(
                                 &path,

@@ -146,7 +146,10 @@ impl FrameTable {
         }
         let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
         if version != FRAME_VERSION {
-            bail!("{}: unsupported frame index version {version}", path.display());
+            bail!(
+                "{}: unsupported frame index version {version}",
+                path.display()
+            );
         }
 
         let mut records = Vec::new();
@@ -277,24 +280,62 @@ impl FrameLog {
 /// (or imported from elsewhere). Returns the compressed offset of each frame
 /// plus the total compressed length consumed.
 pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
+    scan_zstd_frame_offsets_reader(&mut std::io::Cursor::new(data), data.len() as u64)
+}
+
+/// Frame boundaries, read from a stream instead of a buffer.
+///
+/// The scan only ever moves forward — it reads a header, then skips the bytes
+/// that header describes — so it never needed the file in memory. Reading it
+/// all in cost one byte of RAM per byte of archive, which on a corpus-sized
+/// shard is the difference between a few MiB and the whole file.
+///
+/// Bounded memory: headers are read a few bytes at a time and block bodies are
+/// seeked over, never read. `len` is the stream's total length, used for the
+/// same truncation checks the buffered scan made against `data.len()`.
+pub fn scan_zstd_frame_offsets_reader<R: Read + Seek>(src: &mut R, len: u64) -> Result<Vec<u64>> {
     const ZSTD_MAGIC: u32 = 0xFD2F_B528;
     const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
     const SKIPPABLE_MAGIC: u32 = 0x184D_2A50;
 
+    src.seek(SeekFrom::Start(0))?;
     let mut offsets = Vec::new();
-    let mut pos = 0usize;
-    while pos + 4 <= data.len() {
-        let frame_start = pos;
-        let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-        pos += 4;
-        if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
-            if pos + 4 > data.len() {
-                bail!("truncated skippable frame header");
+    let mut pos = 0u64;
+    let mut buf = [0u8; 4];
+
+    // Read exactly `n` bytes at the cursor, advancing `pos`.
+    macro_rules! take {
+        ($n:expr, $what:literal) => {{
+            if pos + $n as u64 > len {
+                bail!($what);
             }
-            let size = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos = pos.checked_add(4 + size).ok_or_else(|| {
-                anyhow::anyhow!("skippable frame size overflow")
-            })?;
+            src.read_exact(&mut buf[..$n])?;
+            pos += $n as u64;
+            &buf[..$n]
+        }};
+    }
+    // Skip `n` bytes without reading them.
+    macro_rules! skip {
+        ($n:expr, $what:literal) => {{
+            let n = $n as u64;
+            if pos + n > len {
+                bail!($what);
+            }
+            src.seek(SeekFrom::Current(n as i64))?;
+            pos += n;
+        }};
+    }
+
+    while pos + 4 <= len {
+        let frame_start = pos;
+        let magic = u32::from_le_bytes(take!(4, "truncated frame magic").try_into().unwrap());
+        if magic & SKIPPABLE_MASK == SKIPPABLE_MAGIC {
+            let size = u32::from_le_bytes(
+                take!(4, "truncated skippable frame header")
+                    .try_into()
+                    .unwrap(),
+            );
+            skip!(size, "truncated skippable frame body");
             continue; // not a data frame, no boundary recorded
         }
         if magic != ZSTD_MAGIC {
@@ -302,65 +343,47 @@ pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
         }
 
         // Frame header
-        if pos >= data.len() {
-            bail!("truncated frame header descriptor");
-        }
-        let fhd = data[pos];
-        pos += 1;
+        let fhd = take!(1, "truncated frame header descriptor")[0];
         let fcs_flag = fhd >> 6;
         let single_segment = (fhd >> 5) & 1 == 1;
         let checksum = (fhd >> 2) & 1 == 1;
         let did_flag = fhd & 3;
-        if !single_segment {
-            pos += 1; // window descriptor
-        }
-        pos += match did_flag {
+        let mut header_rest = usize::from(!single_segment); // window descriptor
+        header_rest += match did_flag {
             0 => 0,
             1 => 1,
             2 => 2,
             _ => 4,
         };
-        pos += match fcs_flag {
+        header_rest += match fcs_flag {
             0 => usize::from(single_segment),
             1 => 2,
             2 => 4,
             _ => 8,
         };
-        if pos > data.len() {
-            bail!("truncated frame header");
-        }
+        skip!(header_rest, "truncated frame header");
 
         // Blocks
         loop {
-            if pos + 3 > data.len() {
-                bail!("truncated block header");
-            }
-            let hdr = u32::from(data[pos])
-                | (u32::from(data[pos + 1]) << 8)
-                | (u32::from(data[pos + 2]) << 16);
-            pos += 3;
+            let hdr = take!(3, "truncated block header");
+            let hdr = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
             let last = hdr & 1 == 1;
             let block_type = (hdr >> 1) & 3;
-            let block_size = (hdr >> 3) as usize;
+            let block_size = hdr >> 3;
             if block_type == 3 {
                 bail!("reserved zstd block type");
             }
             // RLE blocks are a single byte on the wire.
-            pos += if block_type == 1 { 1 } else { block_size };
-            if pos > data.len() {
-                bail!("truncated block body");
-            }
+            let body = if block_type == 1 { 1 } else { block_size };
+            skip!(body, "truncated block body");
             if last {
                 break;
             }
         }
         if checksum {
-            pos += 4;
-            if pos > data.len() {
-                bail!("truncated frame checksum");
-            }
+            skip!(4u32, "truncated frame checksum");
         }
-        offsets.push(frame_start as u64);
+        offsets.push(frame_start);
     }
     Ok(offsets)
 }
@@ -369,6 +392,44 @@ pub fn scan_zstd_frame_offsets(data: &[u8]) -> Result<Vec<u64>> {
 mod tests {
     use super::*;
 
+    /// Multi-frame zstd data plus the offsets it should yield.
+    fn framed(frames: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for i in 0..frames {
+            let body = format!("frame {i} ").repeat(200);
+            out.extend(zstd::encode_all(body.as_bytes(), 3).unwrap());
+        }
+        out
+    }
+
+    /// The streaming scan is the buffered scan: same boundaries, without
+    /// holding the archive in memory.
+    #[test]
+    fn streaming_scan_matches_the_buffered_scan() {
+        for n in [1usize, 2, 7] {
+            let data = framed(n);
+            let want = scan_zstd_frame_offsets(&data).unwrap();
+            assert_eq!(want.len(), n, "expected {n} frames");
+
+            let mut cursor = std::io::Cursor::new(&data);
+            let got = scan_zstd_frame_offsets_reader(&mut cursor, data.len() as u64).unwrap();
+            assert_eq!(got, want);
+
+            // Every reported boundary is a real frame start.
+            for off in &got {
+                assert_eq!(&data[*off as usize..*off as usize + 4], b"\x28\xb5\x2f\xfd");
+            }
+        }
+    }
+
+    /// Truncation must still be an error rather than a short frame list.
+    #[test]
+    fn streaming_scan_rejects_a_truncated_frame() {
+        let data = framed(2);
+        let cut = data.len() - 8;
+        let mut cursor = std::io::Cursor::new(&data[..cut]);
+        assert!(scan_zstd_frame_offsets_reader(&mut cursor, cut as u64).is_err());
+    }
 
     #[test]
     fn sidecar_path_appends_suffix() {

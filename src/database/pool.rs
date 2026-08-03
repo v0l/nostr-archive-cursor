@@ -174,7 +174,10 @@ impl ShardReaderPool {
             Ok(Some(t)) => t,
             Ok(None) => FrameTable::default(),
             Err(e) => {
-                warn!("{}: unusable frame index ({e}), decoding from start", path.display());
+                warn!(
+                    "{}: unusable frame index ({e}), decoding from start",
+                    path.display()
+                );
                 FrameTable::default()
             }
         };
@@ -327,9 +330,11 @@ impl ShardReaderPool {
             let mut output = OutBuffer::around(out);
             loop {
                 let before = output.pos();
-                let hint = dctx.decompress_stream(&mut output, &mut input).map_err(|c| {
-                    anyhow!("zstd decode failed: {}", zstd::zstd_safe::get_error_name(c))
-                })?;
+                let hint = dctx
+                    .decompress_stream(&mut output, &mut input)
+                    .map_err(|c| {
+                        anyhow!("zstd decode failed: {}", zstd::zstd_safe::get_error_name(c))
+                    })?;
                 if output.pos() >= want {
                     break; // early exit: we have everything the group wants
                 }
@@ -442,12 +447,7 @@ impl ShardReaderPool {
 
     /// Serve one frame group: a single read + decode for zstd shards, with
     /// every requested range sliced out of the same decoded buffer.
-    fn run_group(
-        &self,
-        requests: &[ReadRequest],
-        idxs: &[usize],
-        out: &mut Vec<(usize, Vec<u8>)>,
-    ) {
+    fn run_group(&self, requests: &[ReadRequest], idxs: &[usize], out: &mut Vec<(usize, Vec<u8>)>) {
         let path = &requests[idxs[0]].path;
         let reads: Vec<Result<Vec<u8>>> = match path.extension().and_then(|e| e.to_str()) {
             Some("zst") | Some("zstd") => {

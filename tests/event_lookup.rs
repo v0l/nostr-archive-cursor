@@ -1,6 +1,8 @@
 #![cfg(all(feature = "db-rocksdb", feature = "sync"))]
 
-use nostr_archive_cursor::{DefaultJsonFilesDatabase, ScanFallback, rebuild_frame_index, shard_hash};
+use nostr_archive_cursor::{
+    DefaultJsonFilesDatabase, ScanFallback, rebuild_frame_index, shard_hash,
+};
 use nostr_sdk::prelude::*;
 use std::path::PathBuf;
 
@@ -216,16 +218,17 @@ async fn legacy_v0_index_still_serves_lookups_by_scanning() {
     {
         let rocks = rocksdb::DB::open_default(dir.join("index-rocksdb")).unwrap();
         for (id, created_at) in &ids {
-            rocks
-                .put(id.as_bytes(), created_at.to_le_bytes())
-                .unwrap();
+            rocks.put(id.as_bytes(), created_at.to_le_bytes()).unwrap();
         }
     }
 
     // These events carry 2023 timestamps but were written to today's shard, so
     // the cheap Day guess cannot find them - exactly the historical-import case.
     let db = DefaultJsonFilesDatabase::new(&dir).unwrap();
-    assert!(db.locate(&ids[0].0).unwrap().is_none(), "v0 entries have no location");
+    assert!(
+        db.locate(&ids[0].0).unwrap().is_none(),
+        "v0 entries have no location"
+    );
     assert!(
         db.event_by_id(&ids[0].0).await.unwrap().is_none(),
         "Day fallback must not find an event written to a different day's shard"

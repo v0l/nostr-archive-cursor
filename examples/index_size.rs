@@ -50,7 +50,10 @@ fn gib(bytes: u64) -> f64 {
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let src = std::path::PathBuf::from(args.next().expect("usage: index_size <archive> [n]"));
-    let n: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(5_000_000);
+    let n: usize = args
+        .next()
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(5_000_000);
     const TARGET: u64 = 900_000_000;
 
     // Collect (id, created_at, offset, len) from real events, exactly what the

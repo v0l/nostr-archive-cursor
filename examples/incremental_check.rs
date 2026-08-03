@@ -17,9 +17,19 @@ fn open(path: &Path) -> anyhow::Result<Box<dyn Read>> {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let src = PathBuf::from(std::env::args().nth(1).expect("usage: <archive> [per_shard] [shards]"));
-    let per: usize = std::env::args().nth(2).and_then(|a| a.parse().ok()).unwrap_or(200_000);
-    let shards: usize = std::env::args().nth(3).and_then(|a| a.parse().ok()).unwrap_or(4);
+    let src = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("usage: <archive> [per_shard] [shards]"),
+    );
+    let per: usize = std::env::args()
+        .nth(2)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(200_000);
+    let shards: usize = std::env::args()
+        .nth(3)
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(4);
 
     let dir = std::env::temp_dir().join(format!("nac-incr-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -34,15 +44,25 @@ async fn main() -> anyhow::Result<()> {
         let mut n = 0;
         while n < per {
             line.clear();
-            if reader.read_until(b'\n', &mut line)? == 0 { break; }
-            if line.last() != Some(&b'\n') { break; }
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            if line.last() != Some(&b'\n') {
+                break;
+            }
             out.write_all(&line)?;
             n += 1;
         }
         out.finish()?;
     }
-    let total: u64 = std::fs::read_dir(&dir)?.flatten().filter_map(|e| e.metadata().ok().map(|m| m.len())).sum();
-    println!("{shards} single-frame imports, {:.1} MiB total", total as f64 / 1048576.0);
+    let total: u64 = std::fs::read_dir(&dir)?
+        .flatten()
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum();
+    println!(
+        "{shards} single-frame imports, {:.1} MiB total",
+        total as f64 / 1048576.0
+    );
 
     let db = DefaultJsonFilesDatabase::new(&dir)?;
 
@@ -60,8 +80,12 @@ async fn main() -> anyhow::Result<()> {
     let mut n = 0;
     while n < per {
         line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 { break; }
-        if line.last() != Some(&b'\n') { break; }
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        if line.last() != Some(&b'\n') {
+            break;
+        }
         out.write_all(&line)?;
         n += 1;
     }

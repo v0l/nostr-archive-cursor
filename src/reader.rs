@@ -79,8 +79,6 @@ pub(crate) mod sync {
             Ok(())
         }
 
-
-
         /// Read a complete JSON object into the buffer.
         /// Assumes JSON-L format: newline outside string means end of object.
         /// Returns the length of the JSON object, or 0 if EOF.
@@ -618,7 +616,7 @@ mod sync_tests {
         let mut offsets = Vec::new();
         for i in 0..n {
             offsets.push(buf.len() as u64);
-            let head = format!("{{\"id\":\"{i:064x}\",\"content\":\"", );
+            let head = format!("{{\"id\":\"{i:064x}\",\"content\":\"",);
             let tail = "\"}";
             let pad = size.saturating_sub(head.len() + tail.len());
             buf.extend_from_slice(head.as_bytes());
@@ -656,8 +654,7 @@ mod sync_tests {
             data.extend_from_slice(good(0xabc).as_bytes());
             data.extend_from_slice(good(0xdef).as_bytes());
 
-            let mut reader =
-                SyncChunkedJsonReader::new(BufReader::with_capacity(CAP, &data[..]));
+            let mut reader = SyncChunkedJsonReader::new(BufReader::with_capacity(CAP, &data[..]));
             let mut ids = Vec::new();
             let mut offsets = Vec::new();
             let mut buffer = Vec::new();
@@ -698,8 +695,7 @@ mod sync_tests {
             let (data, want) = stream(2000, size);
             // Small BufReader capacity forces many refills, like a decompressor
             // handing out fixed-size chunks.
-            let mut reader =
-                SyncChunkedJsonReader::new(BufReader::with_capacity(4096, &data[..]));
+            let mut reader = SyncChunkedJsonReader::new(BufReader::with_capacity(4096, &data[..]));
             let mut got = Vec::new();
             let mut buffer = Vec::new();
             loop {

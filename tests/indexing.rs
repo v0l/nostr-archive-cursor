@@ -98,7 +98,10 @@ async fn reindexing_the_same_events_does_not_inflate_the_count() {
 
     let r = db.index_new_shards().unwrap();
     assert_eq!(r.indexed, 1, "changed mtime must trigger a re-read");
-    assert_eq!(r.new_events, 0, "re-indexing the same ids adds no new events");
+    assert_eq!(
+        r.new_events, 0,
+        "re-indexing the same ids adds no new events"
+    );
     assert_eq!(
         db.count_keys(),
         400,
@@ -254,7 +257,11 @@ async fn gz_import_converts_to_seekable_zst_and_indexes() {
     let decoded = zstd::decode_all(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(decoded, raw, "conversion must preserve the JSON-L bytes");
     let table = FrameTable::load(&sidecar_path(&out)).unwrap().unwrap();
-    assert!(table.len() > 5, "expected bounded frames, got {}", table.len());
+    assert!(
+        table.len() > 5,
+        "expected bounded frames, got {}",
+        table.len()
+    );
 
     // Drop the original so it is not indexed twice, then index.
     std::fs::remove_file(&gz).unwrap();
@@ -288,5 +295,11 @@ fn converting_a_zst_reframes_in_place() {
         zstd::decode_all(std::fs::File::open(&path).unwrap()).unwrap(),
         before
     );
-    assert!(FrameTable::load(&sidecar_path(&path)).unwrap().unwrap().len() > 5);
+    assert!(
+        FrameTable::load(&sidecar_path(&path))
+            .unwrap()
+            .unwrap()
+            .len()
+            > 5
+    );
 }

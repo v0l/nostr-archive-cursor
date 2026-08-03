@@ -9,7 +9,9 @@
 //!     /path/to/events.jsonl.zst [max_events]
 //! ```
 
-use nostr_archive_cursor::{DEFAULT_FRAME_TARGET, DefaultJsonFilesDatabase, ScanFallback, reframe_archive};
+use nostr_archive_cursor::{
+    DEFAULT_FRAME_TARGET, DefaultJsonFilesDatabase, ScanFallback, reframe_archive,
+};
 use nostr_sdk::prelude::*;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -45,7 +47,10 @@ fn raw_id(line: &[u8]) -> Option<String> {
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
     let mut args = std::env::args().skip(1);
-    let src = PathBuf::from(args.next().expect("usage: real_archive_check <archive> [max]"));
+    let src = PathBuf::from(
+        args.next()
+            .expect("usage: real_archive_check <archive> [max]"),
+    );
     let max: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(200_000);
     let frame_target: u64 = args
         .next()
@@ -195,7 +200,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 4. Single-event latency on real data.
-    let sample: Vec<EventId> = ids.iter().step_by(ids.len().max(1) / 500 + 1).copied().collect();
+    let sample: Vec<EventId> = ids
+        .iter()
+        .step_by(ids.len().max(1) / 500 + 1)
+        .copied()
+        .collect();
     let mut lat: Vec<f64> = Vec::new();
     for id in &sample {
         let t = Instant::now();

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use log::warn;
 use serde::Serialize;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use zstd::Encoder;
 
@@ -253,12 +253,15 @@ impl Drop for CompressedJsonLFile {
 /// Needed for shards written before framing existed and for archives dropped
 /// into the directory by an external relay backup. Costs one full decompress.
 pub fn rebuild_frame_index(path: &Path) -> Result<usize> {
-    let mut data = Vec::new();
-    File::open(path)?.read_to_end(&mut data)?;
-    if data.is_empty() {
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    if len == 0 {
         return Ok(0);
     }
-    let offsets = crate::database::frames::scan_zstd_frame_offsets(&data)?;
+    // Streamed, not slurped: a shard can be larger than RAM, and both this scan
+    // and the per-frame decode below only ever move forward.
+    let mut src = BufReader::new(file);
+    let offsets = crate::database::frames::scan_zstd_frame_offsets_reader(&mut src, len)?;
 
     // Write to a temp path then rename, so a crash can't leave a sidecar that
     // disagrees with the shard.
@@ -274,8 +277,10 @@ pub fn rebuild_frame_index(path: &Path) -> Result<usize> {
             uncompressed,
             compressed: start,
         })?;
-        let end = offsets.get(i + 1).copied().unwrap_or(data.len() as u64);
-        let mut decoder = zstd::stream::Decoder::new(&data[start as usize..end as usize])?;
+        let end = offsets.get(i + 1).copied().unwrap_or(len);
+        src.seek(SeekFrom::Start(start))?;
+        let mut frame = (&mut src).take(end - start);
+        let mut decoder = zstd::stream::Decoder::new(&mut frame)?;
         uncompressed += std::io::copy(&mut decoder, &mut std::io::sink())?;
     }
     drop(log);
