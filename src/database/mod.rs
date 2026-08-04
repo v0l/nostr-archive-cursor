@@ -982,6 +982,12 @@ where
             // Tiny files are cheap to decode whole, so leave them.
             None => compressed_len > self.frame_target,
         };
+        // Reframing writes a full-size copy beside the shard before renaming,
+        // so on a nearly-full volume it can fill the disk. Coarse frames only
+        // make lookups decode more than they need; a full disk loses data.
+        if coarse && !crate::database::file::has_room_to_rewrite(path) {
+            return Ok(false);
+        }
         if !coarse {
             return Ok(false);
         }
@@ -1110,6 +1116,11 @@ where
         );
         if !is_zstd {
             return false; // gz/bz2 have no frame structure to salvage
+        }
+        // Repair also rewrites the shard whole, keeping the original as
+        // `.corrupt`, so it needs even more room than a reframe.
+        if !crate::database::file::has_room_to_rewrite(path) {
+            return false;
         }
         match repair_archive(path, self.frame_target) {
             Ok(Some(report)) => {
@@ -1248,12 +1259,17 @@ where
             .into_iter()
             .filter(|p| crate::cursor::is_walkable_archive(p))
             .collect();
-        let threads = self.rebuild_threads();
+        // Deliberately serial, unlike the read-only scans above. Reframing
+        // rewrites a shard whole, so N of them at once need N shards' worth of
+        // free space simultaneously -- on a volume with one 149 GB shard and
+        // 205 GB free, running these concurrently fills the disk. One at a time
+        // each rewrite reclaims the original's space before the next begins.
         info!(
-            "checking {} shard(s) for coarse frames on {threads} thread(s)",
+            "checking {} shard(s) for coarse frames (serial: each rewrite needs \
+             the shard's size free)",
             coarse.len()
         );
-        Self::for_each_file(&coarse, threads, |path| {
+        Self::for_each_file(&coarse, 1, |path| {
             if let Err(e) = self.reframe_if_coarse(path) {
                 // Reframing decodes the whole shard, so it is the first thing
                 // to notice damage the structural scan called survivable.

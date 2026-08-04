@@ -905,6 +905,50 @@ fn write_framed(src: &mut dyn Read, dst: &Path, frame_target: u64) -> Result<(us
 ///
 /// Only `.zst` archives are handled: converting `.gz`/`.bz2` would change the
 /// file name, and the shard id is derived from that name.
+/// Bytes free on the filesystem holding `path`, or `None` if it cannot be read.
+///
+/// Reframing and repair both write a full-size temporary copy beside the shard
+/// before renaming it into place, so on a nearly-full volume they can fill the
+/// disk -- which is a far worse outcome than leaving a shard coarsely framed.
+pub fn free_bytes(path: &Path) -> Option<u64> {
+    let dir = if path.is_dir() { path } else { path.parent()? };
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path for the duration of the call,
+    // and `stat` is only read after a success return.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(c.as_ptr(), &mut stat) != 0 {
+            return None;
+        }
+        Some(stat.f_bavail as u64 * stat.f_frsize as u64)
+    }
+}
+
+/// Whether `path` can be rewritten in place with room to spare.
+///
+/// A rewrite holds the original and the temporary copy at once, so it needs the
+/// shard's own size free, plus a margin so the volume is never driven to zero.
+pub(crate) fn has_room_to_rewrite(path: &Path) -> bool {
+    const MARGIN: u64 = 8 << 30;
+    let Ok(len) = std::fs::metadata(path).map(|m| m.len()) else {
+        return false;
+    };
+    let Some(free) = free_bytes(path) else {
+        // Unknown: assume the worst rather than fill someone's disk.
+        return false;
+    };
+    if free < len.saturating_add(MARGIN) {
+        warn!(
+            "{}: needs {} MiB free to rewrite (plus margin) but only {} MiB available; skipping",
+            path.display(),
+            len / (1 << 20),
+            free / (1 << 20),
+        );
+        return false;
+    }
+    true
+}
+
 pub fn reframe_archive(path: &Path, frame_target: u64) -> Result<usize> {
     let lock = lock_shard_standalone(path)?;
     let mut tmp = path.as_os_str().to_os_string();
