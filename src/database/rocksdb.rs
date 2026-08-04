@@ -10,7 +10,7 @@ use rocksdb::properties::{
     ESTIMATE_PENDING_COMPACTION_BYTES, ESTIMATE_TABLE_READERS_MEM, LIVE_SST_FILES_SIZE,
     MEM_TABLE_FLUSH_PENDING, SIZE_ALL_MEM_TABLES,
 };
-use rocksdb::{BlockBasedOptions, IteratorMode, Options};
+use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,13 +77,21 @@ impl RocksDbIndex {
         opts.create_if_missing(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Zstd);
 
+        // Bounded descriptor and metadata use: the default (-1) keeps an fd and
+        // a table reader per SST, and each reader holds that file's index and
+        // filter blocks. On a multi-gigabyte index that grows without limit.
+        opts.set_max_open_files(512);
+
         let mut table = BlockBasedOptions::default();
         table.set_bloom_filter(10.0, false);
         // Keys are 32/40 bytes with no shared prefix worth indexing, so bigger
         // blocks trade a little read amplification for much less index size.
         table.set_block_size(16 * 1024);
+        // Cache index/filter blocks rather than pinning them per open file, and
+        // give the cache an explicit budget -- without one, "cached" index and
+        // filter blocks are simply unbounded memory.
+        table.set_block_cache(&Cache::new_lru_cache(512 * 1024 * 1024));
         table.set_cache_index_and_filter_blocks(true);
-        table.set_pin_l0_filter_and_index_blocks_in_cache(true);
         opts.set_block_based_table_factory(&table);
 
         opts
@@ -239,13 +247,25 @@ impl RocksDbIndex {
         let mut opts = Options::default();
         opts.create_if_missing(true);
 
+        // FIRST, because `prepare_for_bulk_load` rewrites the very settings we
+        // care about: it sets all three level-0 triggers to 1<<30 and disables
+        // auto-compaction. Calling it after the triggers below silently undid
+        // them, so a rebuild accumulated level-0 files without ever compacting
+        // -- and with them, the per-file index and filter blocks that made the
+        // process grow by gigabytes until it was OOM-killed.
+        opts.prepare_for_bulk_load();
+
         // Moderate memtable sizes to control memory usage
         // With N threads writing, memory can spike quickly
         opts.set_write_buffer_size(64 * 1024 * 1024); // 64 MiB per memtable
         opts.set_max_write_buffer_number(4);
         opts.set_min_write_buffer_number_to_merge(2);
 
-        // Trigger compaction/flush sooner to prevent memory buildup
+        // Trigger compaction/flush sooner to prevent memory buildup. These come
+        // after `prepare_for_bulk_load` so they win: a rebuild that never
+        // compacts trades a bounded amount of write amplification for unbounded
+        // memory, which is the wrong way round.
+        opts.set_disable_auto_compactions(false);
         opts.set_level_zero_file_num_compaction_trigger(4);
         opts.set_level_zero_slowdown_writes_trigger(8);
         opts.set_level_zero_stop_writes_trigger(12);
@@ -257,8 +277,11 @@ impl RocksDbIndex {
         opts.increase_parallelism(parallelism);
         opts.set_max_background_jobs(parallelism.min(8));
 
-        // Optimize for bulk loading
-        opts.prepare_for_bulk_load();
+        // Bounded descriptor and metadata use. The default (-1) keeps an fd and
+        // a table reader per SST, and a table reader holds that file's index and
+        // filter blocks resident. Across the thousands of files a full rebuild
+        // produces that is gigabytes of memory nothing ever caps.
+        opts.set_max_open_files(512);
 
         // Same on-disk layout as steady state, or a reindex would rewrite the
         // whole index uncompressed.
@@ -266,6 +289,12 @@ impl RocksDbIndex {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_bloom_filter(10.0, false);
         table_opts.set_block_size(16 * 1024);
+        // Index and filter blocks go in the block cache, so they are bounded by
+        // its capacity instead of growing with the number of open files. At 10
+        // bits per key a few hundred million keys is otherwise gigabytes of
+        // filters held outside any budget.
+        table_opts.set_block_cache(&Cache::new_lru_cache(512 * 1024 * 1024));
+        table_opts.set_cache_index_and_filter_blocks(true);
         opts.set_block_based_table_factory(&table_opts);
 
         opts
