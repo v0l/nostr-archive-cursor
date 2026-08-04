@@ -119,6 +119,14 @@ pub struct JsonFilesDatabase<D> {
     /// Salvage damaged shards encountered while indexing (see
     /// [`with_auto_repair`](JsonFilesDatabase::with_auto_repair)).
     auto_repair: bool,
+    /// Files read concurrently by [`rebuild_index`](JsonFilesDatabase::rebuild_index).
+    ///
+    /// `None` means "every core". Each concurrent reader holds its own decode
+    /// buffer and its own chunk of parsed events, so on a host with many cores
+    /// this is a memory knob as much as a speed one: 80 cores means 80 shards
+    /// decompressing at once, which is how a rebuild that scanned happily for
+    /// an hour died the moment it reached the parallel walk.
+    rebuild_parallelism: Option<usize>,
 }
 
 /// How hard to look for an event whose location the index does not know.
@@ -513,7 +521,20 @@ where
             in_flight,
             scan_fallback: ScanFallback::default(),
             auto_repair: true,
+            rebuild_parallelism: None,
         })
+    }
+
+    /// Cap how many shards [`rebuild_index`](Self::rebuild_index) decompresses
+    /// concurrently. Unset means every core.
+    ///
+    /// Each reader carries its own decode buffer and chunk, so this bounds peak
+    /// memory during a rebuild. Set it when the host has far more cores than
+    /// the memory budget can feed -- a rebuild is I/O bound long before it is
+    /// core bound, so a small number costs little throughput.
+    pub fn with_rebuild_parallelism(mut self, n: usize) -> Self {
+        self.rebuild_parallelism = Some(n.max(1));
+        self
     }
 
     /// Open the archive writer for an (already-resolved) current shard path,
@@ -1183,8 +1204,14 @@ where
         self.shards.clear();
         self.pool.clear();
         let db = self.database.clone();
-        crate::NostrCursor::new(self.out_dir.clone())
-            .with_max_parallelism()
+        let cursor = crate::NostrCursor::new(self.out_dir.clone());
+        // Every core by default, but capped when the caller has a tighter
+        // memory budget than the core count implies.
+        let cursor = match self.rebuild_parallelism {
+            Some(n) => cursor.with_parallelism(n),
+            None => cursor.with_max_parallelism(),
+        };
+        cursor
             // No in-memory dedupe during rebuild: it would buffer every event id in a
             // DashMap (millions of ids -> OOM on large archives). Re-inserting the
             // same id is a harmless idempotent overwrite in the KV index, so we just
