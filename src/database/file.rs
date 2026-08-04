@@ -161,19 +161,20 @@ impl CompressedJsonLFile {
         if compressed_len == 0 {
             return Ok(0);
         }
-        let (tail_uncompressed, tail_compressed) = match FrameTable::load(&sidecar_path(path))? {
-            Some(t) => match t.last() {
-                Some(last) => (last.uncompressed, last.compressed),
-                None => (0, 0),
-            },
-            None => {
-                warn!(
-                    "{}: no frame index, decoding the whole shard once to resume appending",
-                    path.display()
-                );
-                (0, 0)
-            }
-        };
+        let (tail_uncompressed, tail_compressed) =
+            match FrameTable::load_or_rebuild(path)? {
+                Some(t) => match t.last() {
+                    Some(last) => (last.uncompressed, last.compressed),
+                    None => (0, 0),
+                },
+                None => {
+                    warn!(
+                        "{}: no frame index, decoding the whole shard once to resume appending",
+                        path.display()
+                    );
+                    (0, 0)
+                }
+            };
         if tail_compressed >= compressed_len {
             // Sidecar already covers the whole file (clean shutdown).
             return Ok(tail_uncompressed);
@@ -1035,6 +1036,47 @@ mod tests {
         let rebuilt = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
         assert_eq!(n, rebuilt.len());
         assert_eq!(original.starts(), rebuilt.starts());
+    }
+
+    /// A non-monotonic sidecar (residue of a crash that interleaved two
+    /// writers) must not be a fatal panic on open: the sidecar is derived data,
+    /// so opening drops it, rebuilds it from the shard's frames, and resumes.
+    ///
+    /// Regression for the ingest segfault where `CompressedJsonLFile::
+    /// with_frame_target` propagated a "non-monotonic frame index" error up to
+    /// a `.expect()` on the RocksDB writer thread, unwinding across the C FFI
+    /// boundary and killing the process with SIGSEGV (exit 139).
+    #[test]
+    fn a_non_monotonic_sidecar_is_rebuilt_not_panicked_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 500, 1024);
+        let table = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        assert!(table.len() > 5, "multi-frame shard");
+
+        // Corrupt the sidecar the way a torn crash-window leaves it: duplicate
+        // the final boundary, which makes the last two records non-monotonic
+        // (a boundary can't repeat) and so `FrameTable::load` rejects the file.
+        let mut raw = std::fs::read(sidecar_path(&path)).unwrap();
+        let n = table.len();
+        let last = table.get(n - 1).unwrap();
+        let mut dup = [0u8; 16];
+        dup[..8].copy_from_slice(&last.uncompressed.to_le_bytes());
+        dup[8..].copy_from_slice(&last.compressed.to_le_bytes());
+        raw.extend_from_slice(&dup);
+        std::fs::write(sidecar_path(&path), &raw).unwrap();
+
+        // Before the fix, this bailed out and the caller's `.expect` panicked.
+        let mut w = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        // The reopened writer appends after the last frame and stays valid.
+        w.write_event(&ev(999)).unwrap();
+        w.finish().unwrap();
+
+        // The rebuilt sidecar is loadable and its frame count is sane.
+        let again = FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+        assert!(again.len() > 0);
+        // Resuming after the rebuilt sidecar still decodes all the events.
+        assert!(events_in(&path).contains(&999));
     }
 
     /// A multi-frame archive plus the events it holds.

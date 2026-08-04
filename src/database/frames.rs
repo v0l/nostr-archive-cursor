@@ -173,6 +173,42 @@ impl FrameTable {
         Ok(Some(table))
     }
 
+    /// Load the frame sidecar for `shard`, rebuilding it when it is corrupt.
+    ///
+    /// The sidecar is pure derived data: every boundary in it is recomputable
+    /// from the `.zst` it describes. So a sidecar that fails to load (bad
+    /// magic, unsupported version, or non-monotonic boundaries -- the usual
+    /// residue of a crash mid-append) is not an error we should propagate up
+    /// to a panic; it is a signal to delete it and regenerate it from the
+    /// frames. Returns `Ok(None)` exactly when there is no sidecar and none
+    /// could be produced (e.g. an empty shard), matching `[`FrameTable::load`]`.
+    ///
+    /// `shard` is the `.zst`/`.jsonl` path (not the sidecar path); the sidecar
+    /// is derived from it.
+    pub fn load_or_rebuild(shard: &Path) -> Result<Option<Self>> {
+        let sidecar = sidecar_path(shard);
+        match Self::load(&sidecar) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                log::warn!(
+                    "{}: corrupt frame sidecar ({e}); rebuilding it from the shard",
+                    sidecar.display()
+                );
+            }
+        }
+        // Drop the bad sidecar, then regenerate it from the shard's frames.
+        // `rebuild_frame_index` writes via a temp path + rename, so a crash
+        // here cannot leave a sidecar that disagrees with the shard.
+        let _ = std::fs::remove_file(&sidecar);
+        match crate::database::file::rebuild_frame_index(shard) {
+            Ok(n) if n > 0 => {}
+            // Empty shard or a rebuild that found nothing clean: treat as
+            // no sidecar, which callers already handle (decode from offset 0).
+            _ => return Ok(None),
+        }
+        Self::load(&sidecar)
+    }
+
     /// Compressed range that must be decoded to read `offset..end`.
     ///
     /// Frames are not guaranteed to break between events: the writer cuts at
