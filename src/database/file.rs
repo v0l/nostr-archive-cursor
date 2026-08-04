@@ -133,11 +133,27 @@ impl CompressedJsonLFile {
         let uncompressed_pos = Self::resume_position(&path, compressed_len)?;
 
         let mut frames = FrameLog::open(&path)?;
-        // Record the boundary for the frame we are about to open.
-        frames.append(FrameStart {
+        // Record the boundary for the frame we are about to open -- unless it
+        // would repeat the last one.
+        //
+        // Every open appends a boundary at EOF, so a process that opened the
+        // shard and died before writing an event left the sidecar's last record
+        // pointing exactly where the next open computes its own. Appending it
+        // again makes the sidecar non-monotonic, which `FrameTable::load`
+        // rejects -- so a crash loop manufactured the very corruption that made
+        // the next start fail. A boundary that does not advance carries no
+        // information, so skipping it is both safe and sufficient.
+        let last = FrameTable::load(&sidecar_path(&path))?.and_then(|t| t.last());
+        let boundary = FrameStart {
             uncompressed: uncompressed_pos,
             compressed: compressed_len,
-        })?;
+        };
+        let advances = last.is_none_or(|l| {
+            boundary.uncompressed > l.uncompressed && boundary.compressed > l.compressed
+        });
+        if advances {
+            frames.append(boundary)?;
+        }
 
         Ok(Self {
             stream: Some(new_encoder(file, level)?),
@@ -1077,6 +1093,50 @@ mod tests {
         assert!(again.len() > 0);
         // Resuming after the rebuilt sidecar still decodes all the events.
         assert!(events_in(&path).contains(&999));
+    }
+
+    /// Opening a shard without writing to it must not corrupt its sidecar.
+    ///
+    /// Every open records the boundary of the frame it is about to write. A
+    /// process that opened the shard and died before writing an event (a crash
+    /// loop) would otherwise append that same boundary again on the next open,
+    /// leaving a duplicate -- a non-monotonic sidecar that the next start then
+    /// refuses to load. The crash loop manufactured its own poison.
+    #[test]
+    fn reopening_without_writing_does_not_corrupt_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl.zst");
+        write_shard(&path, 200, 1024);
+
+        // The first reopen legitimately records one boundary: `finish` closed
+        // the encoder, so the file now extends past the last recorded frame
+        // start and the frame about to be opened begins at EOF.
+        drop(CompressedJsonLFile::with_frame_target(&path, 1024).unwrap());
+        let settled = FrameTable::load(&sidecar_path(&path))
+            .expect("loadable after first reopen")
+            .unwrap();
+
+        // Ten more open/drop cycles with no events written, as a crash loop
+        // does. None of them may add a boundary, and the sidecar must stay
+        // loadable -- becoming unloadable is the bug.
+        for i in 0..10 {
+            drop(CompressedJsonLFile::with_frame_target(&path, 1024).unwrap());
+            let now = FrameTable::load(&sidecar_path(&path))
+                .unwrap_or_else(|e| panic!("sidecar corrupt after reopen {i}: {e}"))
+                .unwrap();
+            assert_eq!(
+                settled.starts(),
+                now.starts(),
+                "reopen {i} appended a boundary without writing anything"
+            );
+        }
+
+        // And the shard is still writable and readable afterwards.
+        let mut w = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        w.write_event(&ev(1234)).unwrap();
+        w.finish().unwrap();
+        assert!(events_in(&path).contains(&1234));
+        FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
     }
 
     /// A multi-frame archive plus the events it holds.
