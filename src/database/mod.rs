@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, NaiveDate, Utc};
 use dashmap::DashMap;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use nostr_sdk::prelude::{
     Backend, BoxedFuture, DatabaseError, DatabaseEventStatus, Events, NostrDatabase,
     RejectedReason, SaveEventStatus,
@@ -997,35 +997,100 @@ where
     /// lookups into it can seek instead of decoding from the start.
     ///
     /// Costs one decompression pass per shard. Returns how many were built.
-    pub fn rebuild_missing_frame_indexes(&self) -> usize {
-        let entries = match std::fs::read_dir(&self.out_dir) {
-            Ok(e) => e,
+    /// Files this rebuild may work on at once.
+    fn rebuild_threads(&self) -> usize {
+        self.rebuild_parallelism
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .max(1)
+    }
+
+    /// Run `f` over `paths` on `threads` workers, returning how many returned
+    /// true.
+    ///
+    /// Shards are wildly uneven in size, so work is pulled from a shared cursor
+    /// rather than sliced up front: a thread that draws the 149 GB shard does
+    /// not leave the others idle behind it.
+    ///
+    /// Every phase here is per-file and independent -- each takes that shard's
+    /// own lock and writes only its own outputs -- so running them concurrently
+    /// changes nothing but the wall clock. And the wall clock is the point:
+    /// these scans are latency bound on small seeking reads, sitting at a few
+    /// percent of one core and a fraction of what the disk can do, so the fix
+    /// is more requests in flight rather than a faster loop.
+    fn for_each_file<F>(paths: &[PathBuf], threads: usize, f: F) -> usize
+    where
+        F: Fn(&Path) -> bool + Sync,
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        let next = AtomicUsize::new(0);
+        let hits = AtomicUsize::new(0);
+        let f = &f;
+        std::thread::scope(|scope| {
+            for _ in 0..threads.min(paths.len().max(1)) {
+                let (next, hits) = (&next, &hits);
+                scope.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, O::Relaxed);
+                        let Some(path) = paths.get(i) else { break };
+                        if f(path) {
+                            hits.fetch_add(1, O::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        hits.load(O::Relaxed)
+    }
+
+    /// Every archive file in the corpus directory.
+    fn archive_files(&self) -> Vec<PathBuf> {
+        match std::fs::read_dir(&self.out_dir) {
+            Ok(entries) => entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file())
+                .collect(),
             Err(e) => {
                 warn!("Failed to list {}: {e}", self.out_dir.display());
-                return 0;
-            }
-        };
-        let mut built = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let is_zstd = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("zst") | Some("zstd")
-            );
-            if !is_zstd || crate::database::frames::sidecar_path(&path).exists() {
-                continue;
-            }
-            match rebuild_frame_index(&path) {
-                Ok(n) => {
-                    debug!("built frame index for {} ({n} frames)", path.display());
-                    built += 1;
-                }
-                Err(e) => warn!("{}: failed to build frame index: {e}", path.display()),
+                Vec::new()
             }
         }
+    }
+
+    pub fn rebuild_missing_frame_indexes(&self) -> usize {
+        let todo: Vec<PathBuf> = self
+            .archive_files()
+            .into_iter()
+            .filter(|path| {
+                let is_zstd = matches!(
+                    path.extension().and_then(|e| e.to_str()),
+                    Some("zst") | Some("zstd")
+                );
+                is_zstd && !crate::database::frames::sidecar_path(path).exists()
+            })
+            .collect();
+        if todo.is_empty() {
+            return 0;
+        }
+        let threads = self.rebuild_threads();
+        info!(
+            "building {} missing frame index(es) on {threads} thread(s)",
+            todo.len()
+        );
+        let built = Self::for_each_file(&todo, threads, |path| match rebuild_frame_index(path) {
+            Ok(n) => {
+                debug!("built frame index for {} ({n} frames)", path.display());
+                true
+            }
+            Err(e) => {
+                warn!("{}: failed to build frame index: {e}", path.display());
+                false
+            }
+        });
         self.pool.clear();
         built
     }
@@ -1143,21 +1208,20 @@ where
             return 0;
         }
         let live = Self::get_archive_path(&self.out_dir, &Utc::now());
-        let entries = match std::fs::read_dir(&self.out_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                warn!("Failed to list {}: {e}", self.out_dir.display());
-                return 0;
-            }
-        };
-        let mut repaired = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() && path != live && self.repair_if_damaged(&path) {
-                repaired += 1;
-            }
+        let todo: Vec<PathBuf> = self
+            .archive_files()
+            .into_iter()
+            .filter(|p| *p != live)
+            .collect();
+        if todo.is_empty() {
+            return 0;
         }
-        repaired
+        let threads = self.rebuild_threads();
+        info!(
+            "scanning {} shard(s) for damage on {threads} thread(s)",
+            todo.len()
+        );
+        Self::for_each_file(&todo, threads, |path| self.repair_if_damaged(path))
     }
 
     /// Rebuilt event id index using parallel std::thread workers.
@@ -1179,18 +1243,24 @@ where
         // repair moves events costs nothing.
         self.repair_damaged_shards_except_live();
         self.rebuild_missing_frame_indexes();
-        for entry in std::fs::read_dir(&self.out_dir)?.flatten() {
-            let path = entry.path();
-            if path.is_file()
-                && crate::cursor::is_walkable_archive(&path)
-                && let Err(e) = self.reframe_if_coarse(&path)
-            {
+        let coarse: Vec<PathBuf> = self
+            .archive_files()
+            .into_iter()
+            .filter(|p| crate::cursor::is_walkable_archive(p))
+            .collect();
+        let threads = self.rebuild_threads();
+        info!(
+            "checking {} shard(s) for coarse frames on {threads} thread(s)",
+            coarse.len()
+        );
+        Self::for_each_file(&coarse, threads, |path| {
+            if let Err(e) = self.reframe_if_coarse(path) {
                 // Reframing decodes the whole shard, so it is the first thing
                 // to notice damage the structural scan called survivable.
                 // Salvage and retry once before giving up on the shard.
                 warn!("{}: reframe failed: {e}", path.display());
-                if self.repair_if_damaged(&path)
-                    && let Err(e) = self.reframe_if_coarse(&path)
+                if self.repair_if_damaged(path)
+                    && let Err(e) = self.reframe_if_coarse(path)
                 {
                     warn!(
                         "{}: reframe still failing after repair: {e}",
@@ -1198,7 +1268,8 @@ where
                     );
                 }
             }
-        }
+            false
+        });
         self.database.wipe()?;
         self.database.setup_for_reindex()?;
         self.shards.clear();
