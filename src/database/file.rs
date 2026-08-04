@@ -592,6 +592,24 @@ impl SalvageReader {
         (self.lines, self.bytes, self.dropped)
     }
 
+    /// Drop `held` once it is too long to be a line, returning whether it did.
+    ///
+    /// Bounds the salvage buffer: see [`MAX_HELD`].
+    fn discard_overlong(&mut self) -> bool {
+        if self.held.len() <= MAX_HELD {
+            return false;
+        }
+        warn!(
+            "{}: {} bytes with no line boundary at frame {}; dropping (not JSONL)",
+            self.path.display(),
+            self.held.len(),
+            self.frame_start
+        );
+        self.dropped += self.held.len() as u64;
+        self.held.clear();
+        true
+    }
+
     /// Finish with the current frame, discarding any half-line it ended on and
     /// recording how far it got.
     fn end_frame(&mut self) {
@@ -603,6 +621,18 @@ impl SalvageReader {
         self.held.clear();
     }
 }
+
+/// Longest run without a newline that can still plausibly be part of a line.
+///
+/// Salvage decodes damaged frames, and a damaged frame can decode to a long
+/// stretch of binary garbage containing no newline at all. `held` buffers until
+/// it sees one, so without a ceiling a single damaged frame buffers its entire
+/// decoded output into memory -- which on a 149 GB shard is gigabytes of anon
+/// growing at decode speed until the process is OOM-killed.
+///
+/// No JSONL event line is remotely this long, so a run this size is not a line:
+/// drop it and resynchronise at the next newline.
+const MAX_HELD: usize = 64 * 1024 * 1024;
 
 impl Read for SalvageReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
@@ -659,23 +689,47 @@ impl Read for SalvageReader {
                     continue;
                 }
                 Ok(n) => {
+                    // Everything already in `held` has been scanned and holds no
+                    // newline, so only the newly decoded bytes can introduce
+                    // one. Rescanning the whole buffer on every read makes a
+                    // long newline-free run quadratic in its length.
+                    let mut search_from = self.held.len();
                     self.held.extend_from_slice(&self.scratch[..n]);
+
                     if self.skip_head {
                         // Everything up to the first newline belongs to an
                         // event whose start went with the previous frame.
-                        match self.held.iter().position(|&b| b == b'\n') {
-                            Some(nl) => {
+                        match self.held[search_from..].iter().position(|&b| b == b'\n') {
+                            Some(rel) => {
+                                let nl = search_from + rel;
                                 self.dropped += nl as u64 + 1;
                                 self.held.drain(..=nl);
                                 self.skip_head = false;
+                                // What survives the drain is only ever the tail
+                                // of this read, so scanning it whole is cheap.
+                                search_from = 0;
                             }
-                            None => continue,
+                            None => {
+                                // Still no newline to resynchronise on. Keep
+                                // discarding rather than buffering garbage.
+                                self.discard_overlong();
+                                continue;
+                            }
                         }
                     }
-                    match self.held.iter().rposition(|&b| b == b'\n') {
-                        Some(cut) => self.emit_lines(cut),
-                        // No line boundary yet - keep buffering.
-                        None => continue,
+
+                    match self.held[search_from..].iter().rposition(|&b| b == b'\n') {
+                        Some(rel) => self.emit_lines(search_from + rel),
+                        // No line boundary yet - keep buffering, but only up to
+                        // a plausible line length (see MAX_HELD).
+                        None => {
+                            if self.discard_overlong() {
+                                // Mid-garbage: whatever follows up to the next
+                                // newline is the tail of something unusable.
+                                self.skip_head = true;
+                            }
+                            continue;
+                        }
                     }
                 }
             }
@@ -1137,6 +1191,60 @@ mod tests {
         w.finish().unwrap();
         assert!(events_in(&path).contains(&1234));
         FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
+    }
+
+    /// Salvaging a frame that decodes to a long run with no newline must not
+    /// buffer it all in memory.
+    ///
+    /// A damaged shard can decode to gigabytes of binary garbage containing no
+    /// line boundary. `held` buffers until it sees one, so without a ceiling a
+    /// single frame grows anon memory at decode speed until the process is
+    /// OOM-killed -- observed in production as ~65 MB/s of linear growth that
+    /// ate a 16 GiB budget in four minutes.
+    #[test]
+    fn salvage_does_not_buffer_a_newline_free_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.jsonl.zst");
+
+        // One frame holding well over MAX_HELD bytes without a single newline.
+        let junk = vec![b'x'; MAX_HELD + (8 << 20)];
+        let mut enc = zstd::stream::Encoder::new(File::create(&path).unwrap(), 1).unwrap();
+        enc.write_all(&junk).unwrap();
+        // Then a real event, so we can prove salvage resynchronises.
+        enc.write_all(b"\n").unwrap();
+        enc.write_all(serde_json::to_string(&ev(7)).unwrap().as_bytes())
+            .unwrap();
+        enc.write_all(b"\n").unwrap();
+        enc.finish().unwrap().flush().unwrap();
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        let mut r = SalvageReader::open(&path, vec![0], len).unwrap();
+
+        // Drain it fully; `held` must never exceed the ceiling (plus one read).
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            assert!(
+                r.held.len() <= MAX_HELD + 256 * 1024,
+                "held grew unbounded: {} bytes",
+                r.held.len()
+            );
+        }
+
+        // The garbage was dropped, and the real event after it survived.
+        let (_, _, dropped) = r.stats();
+        assert!(dropped as usize >= MAX_HELD, "garbage should be dropped");
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("\"n\":7"),
+            "salvage must resynchronise and keep the event after the garbage, got {} bytes",
+            out.len()
+        );
     }
 
     /// A multi-frame archive plus the events it holds.
