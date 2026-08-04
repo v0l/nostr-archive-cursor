@@ -148,6 +148,15 @@ impl CompressedJsonLFile {
             uncompressed: uncompressed_pos,
             compressed: compressed_len,
         };
+        // Stricter than what `FrameTable::load` accepts, deliberately. A
+        // sidecar may legitimately *contain* empty frames (equal `uncompressed`
+        // offsets), but there is no reason to *write* one: a boundary that adds
+        // no decompressed bytes describes a frame with nothing to seek to.
+        //
+        // Requiring `uncompressed` to advance is also what stops a crash loop
+        // from growing the sidecar: closing the encoder on drop writes a frame
+        // footer, so `compressed` creeps forward on every open even when no
+        // event was written, and a `compressed`-only test would append forever.
         let advances = last.is_none_or(|l| {
             boundary.uncompressed > l.uncompressed && boundary.compressed > l.compressed
         });
@@ -1245,6 +1254,45 @@ mod tests {
             "salvage must resynchronise and keep the event after the garbage, got {} bytes",
             out.len()
         );
+    }
+
+    /// A shard whose frames are empty decompresses to nothing, so consecutive
+    /// boundaries share an `uncompressed` offset. That is legitimate, and
+    /// rejecting it was unrecoverable: rebuilding regenerates the identical
+    /// table, so the shard could never be opened again and the writer dropped
+    /// every event routed to it.
+    #[test]
+    fn empty_frames_are_a_valid_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.jsonl.zst");
+
+        // Two empty zstd frames back to back: no decompressed bytes at all.
+        let mut f = File::create(&path).unwrap();
+        for _ in 0..2 {
+            let enc = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+            f.write_all(&enc.finish().unwrap()).unwrap();
+        }
+        f.flush().unwrap();
+        drop(f);
+
+        let n = rebuild_frame_index(&path).unwrap();
+        assert!(n >= 1, "frames should be found");
+        let table = FrameTable::load(&sidecar_path(&path))
+            .expect("a sidecar of empty frames must load")
+            .unwrap();
+        // Same uncompressed offset, advancing compressed offset.
+        if table.len() >= 2 {
+            let (a, b) = (table.get(0).unwrap(), table.get(1).unwrap());
+            assert_eq!(a.uncompressed, b.uncompressed, "empty frames add no bytes");
+            assert!(b.compressed > a.compressed, "but do advance in the file");
+        }
+
+        // And the writer can open it -- the bug was that it never could again.
+        let mut w = CompressedJsonLFile::with_frame_target(&path, 1024).unwrap();
+        w.write_event(&ev(5)).unwrap();
+        w.finish().unwrap();
+        assert!(events_in(&path).contains(&5));
+        FrameTable::load(&sidecar_path(&path)).unwrap().unwrap();
     }
 
     /// A multi-frame archive plus the events it holds.

@@ -157,14 +157,22 @@ impl FrameTable {
         // A crash can leave a partial record; ignore the tail.
         records.truncate(records.len() / 16 * 16);
         let table = Self { records };
-        // Boundaries must be strictly increasing; anything else means a
-        // corrupt sidecar and we would rather rebuild than seek to garbage.
+        // Boundaries must advance; anything else means a corrupt sidecar and we
+        // would rather rebuild than seek to garbage.
         // (Cheap: one pass over ~16 bytes per frame, done once per shard.)
+        //
+        // `compressed` strictly increases -- each frame starts after the last.
+        // `uncompressed` only has to be non-decreasing, because an *empty*
+        // frame contributes no decompressed bytes and so shares its
+        // predecessor's offset. Demanding that both increase rejected the
+        // legitimate sidecar of a shard holding empty frames, and since
+        // rebuilding regenerates exactly the same table, such a shard could
+        // never be opened again -- the writer dropped every event for it.
         let mut prev: Option<FrameStart> = None;
         for i in 0..table.len() {
             let cur = table.get(i).unwrap();
             if let Some(p) = prev
-                && (cur.uncompressed <= p.uncompressed || cur.compressed <= p.compressed)
+                && (cur.compressed <= p.compressed || cur.uncompressed < p.uncompressed)
             {
                 bail!("{}: non-monotonic frame index", path.display());
             }
