@@ -93,6 +93,32 @@ pub struct NostrCursor {
     dedupe: bool,
 }
 
+/// Smallest archive worth splitting: a segment costs one extra frame of
+/// decode, and the work queue already balances across files.
+const MIN_SPLIT_BYTES: u64 = 1 << 30;
+
+/// One unit of reading work: a whole file, or a slice of one.
+///
+/// A single archive can hold a fifth of a corpus -- one shard here is
+/// 149 GB -- and parallelising across files leaves every worker but one
+/// idle for hours at the end of a pass. A framed zstd archive can be split
+/// on its frame boundaries, which is exactly what the frame sidecar records
+/// and why it exists.
+#[derive(Clone, Debug)]
+pub(crate) struct Segment {
+    pub path: PathBuf,
+    /// Where to start decoding, as a compressed byte offset. Deliberately
+    /// one frame *before* `start`, so the reader meets a line break and
+    /// resynchronises before it reaches the bytes this segment owns.
+    pub seek_to: u64,
+    /// Decompressed offset of the first byte this segment owns.
+    pub decode_from: u64,
+    /// First decompressed offset this segment does *not* own.
+    pub start: u64,
+    pub end: Option<u64>,
+}
+
+
 impl NostrCursor {
     /// Creates a new cursor for reading Nostr events from a directory.
     ///
@@ -741,12 +767,27 @@ impl NostrCursor {
         // Wrap callback in Arc for sharing across threads
         let callback = Arc::new(callback);
 
-        // Track file progress
-        let total_files = files.len();
+        // Split large framed archives so one huge shard cannot serialise the
+        // tail of a pass onto a single worker. Small and unseekable archives
+        // stay whole, so this is a no-op for a directory of ordinary dumps.
+        let segments: Vec<Segment> = files
+            .iter()
+            .flat_map(|p| Self::plan_segments(p, parallelism))
+            .collect();
+        if segments.len() > files.len() {
+            log::info!(
+                "{} archive(s) split into {} segments for {parallelism} worker(s)",
+                files.len(),
+                segments.len()
+            );
+        }
+
+        // Track progress
+        let total_files = segments.len();
         let processed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        // Use a work-stealing approach with a shared file queue
-        let file_queue = Arc::new(Mutex::new(files.into_iter()));
+        // Use a work-stealing approach with a shared queue
+        let file_queue = Arc::new(Mutex::new(segments.into_iter()));
 
         // Spawn worker threads
         let handles: Vec<_> = (0..parallelism)
@@ -766,17 +807,27 @@ impl NostrCursor {
                                 queue.next()
                             };
 
-                            let path = match path {
+                            let seg = match path {
                                 Some(p) => p,
-                                None => break, // No more files
+                                None => break, // No more work
                             };
 
                             let current = processed_count
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                                 + 1;
-                            log::info!("Reading [{}/{}]: {}", current, total_files, path.display());
-                            Self::read_file_sync_chunked(
-                                &path,
+                            log::info!(
+                                "Reading [{}/{}]: {}{}",
+                                current,
+                                total_files,
+                                seg.path.display(),
+                                match seg.end {
+                                    Some(e) => format!(" [{}..{}]", seg.start, e),
+                                    None if seg.start > 0 => format!(" [{}..]", seg.start),
+                                    None => String::new(),
+                                }
+                            );
+                            Self::read_segment_sync_chunked(
+                                &seg,
                                 &*callback,
                                 ids.clone(),
                                 chunk_size,
@@ -803,6 +854,110 @@ impl NostrCursor {
 
     /// Opens a file synchronously, handling compression based on extension.
     /// Returns a BufRead - decompressors are wrapped in BufReader.
+    /// Split `path` into at most `want` segments on frame boundaries.
+    ///
+    /// Returns a single whole-file segment when the archive cannot be seeked
+    /// into: gzip and bzip2 have no frame structure, and a zstd archive with no
+    /// (or a one-entry) sidecar is a single frame that must be decoded from the
+    /// start regardless.
+    pub(crate) fn plan_segments(path: &PathBuf, want: usize) -> Vec<Segment> {
+        Self::plan_segments_with_min(path, want, MIN_SPLIT_BYTES)
+    }
+
+    /// [`plan_segments`](Self::plan_segments) with an explicit size threshold,
+    /// so tests can split archives smaller than the production minimum.
+    #[cfg(test)]
+    pub(crate) fn plan_segments_for_test(
+        path: &PathBuf,
+        want: usize,
+        min_bytes: u64,
+    ) -> Vec<Segment> {
+        Self::plan_segments_with_min(path, want, min_bytes)
+    }
+
+    fn plan_segments_with_min(path: &PathBuf, want: usize, min_bytes: u64) -> Vec<Segment> {
+        let whole = |p: &PathBuf| {
+            vec![Segment {
+                path: p.clone(),
+                seek_to: 0,
+                decode_from: 0,
+                start: 0,
+                end: None,
+            }]
+        };
+        if want <= 1 {
+            return whole(path);
+        }
+        let is_zstd = matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("zst") | Some("zstd")
+        );
+        if !is_zstd {
+            return whole(path);
+        }
+        match std::fs::metadata(path) {
+            Ok(m) if m.len() >= min_bytes => {}
+            _ => return whole(path),
+        }
+        let sidecar = crate::database::frames::sidecar_path(path);
+        let table = match crate::database::frames::FrameTable::load(&sidecar) {
+            Ok(Some(t)) if t.len() > 2 => t,
+            _ => return whole(path),
+        };
+
+        // Cut on frame boundaries, spaced evenly through the frame list.
+        let frames = table.len();
+        let cuts = want.min(frames);
+        let mut segments = Vec::with_capacity(cuts);
+        for i in 0..cuts {
+            let idx = i * frames / cuts;
+            let here = match table.get(idx) {
+                Some(f) => f,
+                None => continue,
+            };
+            // Start decoding a frame early so the reader sees a newline and
+            // resyncs before reaching `start`; objects before `start` are then
+            // discarded by offset. Without the overlap an event beginning
+            // exactly on the boundary is dropped by both neighbours.
+            let back = table.get(idx.saturating_sub(1)).unwrap_or(here);
+            let next = (i + 1 < cuts)
+                .then(|| (i + 1) * frames / cuts)
+                .and_then(|n| table.get(n));
+            segments.push(Segment {
+                path: path.clone(),
+                seek_to: if idx == 0 { 0 } else { back.compressed },
+                decode_from: if idx == 0 { 0 } else { back.uncompressed },
+                start: here.uncompressed,
+                end: next.map(|f| f.uncompressed),
+            });
+        }
+        if segments.is_empty() {
+            return whole(path);
+        }
+        log::debug!(
+            "{}: split into {} segment(s) across {frames} frames",
+            path.display(),
+            segments.len()
+        );
+        segments
+    }
+
+    /// Open an archive positioned at a compressed byte offset.
+    fn open_segment_sync(
+        path: &PathBuf,
+        seek_to: u64,
+    ) -> anyhow::Result<Box<dyn std::io::BufRead + Send>> {
+        if seek_to == 0 {
+            return Self::open_file_sync(path);
+        }
+        use std::io::Seek;
+        let mut f = std::fs::File::open(path)?;
+        f.seek(std::io::SeekFrom::Start(seek_to))?;
+        Ok(Box::new(std::io::BufReader::new(
+            zstd::stream::Decoder::new(f)?,
+        )))
+    }
+
     fn open_file_sync(path: &PathBuf) -> anyhow::Result<Box<dyn std::io::BufRead + Send>> {
         let f = std::fs::File::open(path)?;
         match path.extension() {
@@ -832,7 +987,31 @@ impl NostrCursor {
     ) where
         F: Fn(&std::path::Path, Vec<LocatedEvent<'_>>),
     {
-        let reader = match Self::open_file_sync(path) {
+        Self::read_segment_sync_chunked(
+            &Segment {
+                path: path.clone(),
+                seek_to: 0,
+                decode_from: 0,
+                start: 0,
+                end: None,
+            },
+            callback,
+            ids,
+            chunk_size,
+        )
+    }
+
+    /// Read one segment of an archive, reporting absolute offsets.
+    fn read_segment_sync_chunked<F>(
+        seg: &Segment,
+        callback: &F,
+        ids: Option<std::sync::Arc<dashmap::DashMap<EventId, ()>>>,
+        chunk_size: usize,
+    ) where
+        F: Fn(&std::path::Path, Vec<LocatedEvent<'_>>),
+    {
+        let path = &seg.path;
+        let reader = match Self::open_segment_sync(path, seg.seek_to) {
             Ok(r) => r,
             Err(e) => {
                 log::error!("Failed to open file {}: {}", path.display(), e);
@@ -840,9 +1019,12 @@ impl NostrCursor {
             }
         };
 
-        let mut reader = crate::reader::sync::SyncChunkedJsonReader::new(reader);
+        let mut reader =
+            crate::reader::sync::SyncChunkedJsonReader::with_base(reader, seg.decode_from);
         let mut objects = 0u64;
         let mut events = 0u64;
+        // Set once this segment has read past the range it owns.
+        let mut done = false;
 
         // Pre-allocate reusable buffers
         let mut buffer_pool: Vec<Vec<u8>> =
@@ -867,21 +1049,49 @@ impl NostrCursor {
                 } else {
                     buffer.clear();
                 }
-                match reader.read_json_object(buffer) {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        offsets[buffer_count] = reader.last_object_offset();
-                        objects += 1;
-                        buffer_count += 1;
-                    }
-                    Err(e) => {
-                        if is_end_of_stream(&e) {
-                            log::debug!("EOF (open or truncated final frame)");
-                        } else {
-                            log::error!("Error reading file: {}", e);
+                // Keep reading into *this* buffer until it holds an object the
+                // segment owns. Skipping by advancing the loop instead would
+                // leave `buffer_count` pointing at a slot the parse step never
+                // filled, and every offset after it would describe the wrong
+                // event.
+                let mut kept = false;
+                loop {
+                    match reader.read_json_object(buffer) {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            let at = reader.last_object_offset();
+                            // Bytes before `start` belong to the previous
+                            // segment; we only decoded them to resynchronise on
+                            // a line break.
+                            if at < seg.start {
+                                buffer.clear();
+                                continue;
+                            }
+                            // An event beginning at or past `end` is the next
+                            // segment's. One that merely *extends* past it is
+                            // ours, so ownership is decided by where it starts.
+                            if seg.end.is_some_and(|e| at >= e) {
+                                done = true;
+                                break;
+                            }
+                            offsets[buffer_count] = at;
+                            objects += 1;
+                            buffer_count += 1;
+                            kept = true;
+                            break;
                         }
-                        break;
+                        Err(e) => {
+                            if is_end_of_stream(&e) {
+                                log::debug!("EOF (open or truncated final frame)");
+                            } else {
+                                log::error!("Error reading file: {}", e);
+                            }
+                            break;
+                        }
                     }
+                }
+                if !kept {
+                    break;
                 }
             }
 
@@ -930,6 +1140,154 @@ impl NostrCursor {
 
             if !parsed_events.is_empty() {
                 callback(path, parsed_events);
+            }
+
+            if done {
+                log::info!("segment end. objects={objects}, events={events}");
+                break;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sync"))]
+mod segment_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Write a framed archive of `n` events, returning its path.
+    fn write_archive(dir: &std::path::Path, n: u64, frame_target: u64) -> PathBuf {
+        #[derive(serde::Serialize)]
+        struct Ev {
+            id: String,
+            pubkey: String,
+            created_at: u64,
+            kind: u16,
+            tags: Vec<Vec<String>>,
+            content: String,
+            sig: String,
+        }
+        let path = dir.join("events_20240101.jsonl.zst");
+        let mut w =
+            crate::database::file::CompressedJsonLFile::with_frame_target(&path, frame_target)
+                .unwrap();
+        for i in 0..n {
+            w.write_event(&Ev {
+                id: format!("{i:064x}"),
+                pubkey: "b".repeat(64),
+                created_at: 1_700_000_000 + i,
+                kind: 1,
+                tags: vec![],
+                // Vary the length so events straddle frame boundaries.
+                content: "x".repeat((i % 97) as usize + 1),
+                sig: "c".repeat(128),
+            })
+            .unwrap();
+        }
+        w.finish().unwrap();
+        path
+    }
+
+    /// Read every event via the public walk, at a given parallelism.
+    fn walk(dir: &std::path::Path, parallelism: usize) -> Vec<(String, u64, u32)> {
+        let seen: Arc<Mutex<Vec<(String, u64, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let out = seen.clone();
+        NostrCursor::new(dir.to_path_buf())
+            .with_parallelism(parallelism)
+            .with_dedupe(false)
+            .walk_with_chunked_sync_located(
+                move |_p, events| {
+                    let mut g = out.lock().unwrap();
+                    for e in events {
+                        g.push((e.event.id.to_string(), e.offset, e.len));
+                    }
+                },
+                64,
+            );
+        let mut v = Arc::try_unwrap(seen).unwrap().into_inner().unwrap();
+        v.sort();
+        v
+    }
+
+    /// Splitting an archive across workers must not change what is read.
+    ///
+    /// Every event, exactly once, with the same offset and length as a
+    /// single-threaded pass -- offsets are what the index stores, so a segment
+    /// that reported them relative to its own slice would make every lookup
+    /// into that shard read the wrong bytes.
+    #[test]
+    fn segmented_reads_match_a_whole_file_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // Small frames so a 1 GiB-threshold-exempt file still yields many.
+        let path = write_archive(dir.path(), 20_000, 4096);
+        let table =
+            crate::database::frames::FrameTable::load(&crate::database::frames::sidecar_path(&path))
+                .unwrap()
+                .unwrap();
+        assert!(table.len() > 8, "need several frames to split across");
+
+        let whole = walk(dir.path(), 1);
+        assert_eq!(whole.len(), 20_000, "baseline must see every event");
+
+        // Force splitting regardless of the size threshold by planning directly.
+        for workers in [2usize, 4, 8] {
+            let segs = NostrCursor::plan_segments_for_test(&path, workers, 0);
+            assert!(segs.len() > 1, "expected a split at {workers} workers");
+
+            let seen: Arc<Mutex<Vec<(String, u64, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+            for seg in &segs {
+                let out = seen.clone();
+                NostrCursor::read_segment_sync_chunked(
+                    seg,
+                    &move |_p: &std::path::Path, events: Vec<LocatedEvent<'_>>| {
+                        let mut g = out.lock().unwrap();
+                        for e in events {
+                            g.push((e.event.id.to_string(), e.offset, e.len));
+                        }
+                    },
+                    None,
+                    64,
+                );
+            }
+            let mut got = Arc::try_unwrap(seen).unwrap().into_inner().unwrap();
+            got.sort();
+            assert_eq!(
+                got.len(),
+                whole.len(),
+                "{workers} segments changed the event count"
+            );
+            assert_eq!(got, whole, "{workers} segments changed events or offsets");
+        }
+    }
+
+    /// Offsets from a segmented read must still point at the right bytes.
+    #[test]
+    fn segment_offsets_locate_the_original_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_archive(dir.path(), 5_000, 4096);
+        let segs = NostrCursor::plan_segments_for_test(&path, 4, 0);
+        assert!(segs.len() > 1);
+
+        let pool = crate::ShardReaderPool::new();
+        for seg in &segs {
+            let seen: Arc<Mutex<Vec<(String, u64, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+            let out = seen.clone();
+            NostrCursor::read_segment_sync_chunked(
+                seg,
+                &move |_p: &std::path::Path, events: Vec<LocatedEvent<'_>>| {
+                    let mut g = out.lock().unwrap();
+                    for e in events {
+                        g.push((e.event.id.to_string(), e.offset, e.len));
+                    }
+                },
+                None,
+                64,
+            );
+            let got = Arc::try_unwrap(seen).unwrap().into_inner().unwrap();
+            for (id, offset, len) in got.iter().take(20) {
+                let bytes = pool.read_zstd_range(&path, *offset, *len).unwrap();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(v["id"].as_str().unwrap(), id, "offset {offset} misreads");
             }
         }
     }

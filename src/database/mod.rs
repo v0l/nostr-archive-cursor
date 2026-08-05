@@ -13,7 +13,7 @@ use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-mod file;
+pub(crate) mod file;
 pub mod frames;
 pub use frames::{
     Damage, FrameSpan, FrameStart, FrameTable, ScanReport, scan_zstd_frame_starts,

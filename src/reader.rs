@@ -39,10 +39,20 @@ pub(crate) mod sync {
 
     impl<R: BufRead> SyncChunkedJsonReader<R> {
         pub fn new(reader: R) -> Self {
+            Self::with_base(reader, 0)
+        }
+
+        /// As [`new`](Self::new), for a reader positioned `base` bytes into the
+        /// decompressed stream.
+        ///
+        /// Offsets are reported absolutely, so a caller decoding one segment of
+        /// a large archive still records the position an event occupies in the
+        /// whole file rather than within its slice.
+        pub fn with_base(reader: R, base: u64) -> Self {
             Self {
                 reader,
-                pos: 0,
-                obj_start: 0,
+                pos: base,
+                obj_start: base,
                 prev_byte: 0,
             }
         }
