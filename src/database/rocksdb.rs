@@ -199,7 +199,19 @@ impl RocksDbIndex {
     /// a relative ratio of the estimate and an absolute floor (to avoid false
     /// positives on tiny databases where the estimate is unreliable).
     fn auto_repair_count_if_diverged(&self) -> bool {
-        const REL_THRESHOLD: f64 = 0.10; // >10% divergence
+        // `estimate-num-keys` sums SST table properties and does not reconcile
+        // a key written more than once across levels. `rebuild_index` bulk-loads
+        // with overwrites by design -- re-inserting an id is an idempotent
+        // overwrite -- so on a rebuilt index the estimate sits well below the
+        // true key count and never converges.
+        //
+        // At 10% this fired on every single start of a healthy 897M-event
+        // index (estimate 1.60G against 1.79G expected, 11% low) and spent
+        // ~20 minutes rescanning to confirm the cached count was already
+        // correct -- before the port was even bound, and filling ~29 GB of page
+        // cache immediately before the server allocates its own working set.
+        // The band has to reflect what this estimator can actually promise.
+        const REL_THRESHOLD: f64 = 0.30;
         const ABS_THRESHOLD: u64 = 1000; // ...and at least this many keys
 
         let Some(database) = self.database.as_ref() else {
@@ -227,8 +239,8 @@ impl RocksDbIndex {
 
         if diverged {
             warn!(
-                "Event index count looks stale (cached={cached}, estimate={estimate}); \
-                 running repair_count() to rescan."
+                "Event index count looks stale (cached={cached} events = {expected} keys, \
+                 estimate={estimate} keys); running repair_count() to rescan."
             );
             match self.repair_count() {
                 Ok(n) => {
