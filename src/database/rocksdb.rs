@@ -181,11 +181,9 @@ impl RocksDbIndex {
             time_ready,
         };
 
-        // Sanity-check the cached count against RocksDB's key estimate. If a
-        // concurrent writer / crash left the persisted count badly wrong (e.g. reset
-        // to 0 during a k8s rollout while data remained), the two will diverge far
-        // beyond normal estimate noise. Auto-repair in that case so a restart
-        // recovers instead of trusting the stale count forever.
+        // Heal a count left catastrophically wrong -- reset to zero by a crash
+        // mid-rollout while the data survived. Deliberately a ratio test and
+        // not a percentage one: see `auto_repair_count_if_diverged`.
         index.auto_repair_count_if_diverged();
 
         Ok(index)
@@ -193,6 +191,8 @@ impl RocksDbIndex {
 
     /// Compare the cached count with `ESTIMATE_NUM_KEYS` and run `repair_count()`
     /// when they disagree by more than the threshold. Returns true if a repair ran.
+    ///
+
     ///
     /// `ESTIMATE_NUM_KEYS` is an approximation and also counts the meta key, so we
     /// only treat large divergences as corruption: the difference must exceed both
@@ -211,7 +211,12 @@ impl RocksDbIndex {
         // correct -- before the port was even bound, and filling ~29 GB of page
         // cache immediately before the server allocates its own working set.
         // The band has to reflect what this estimator can actually promise.
-        const REL_THRESHOLD: f64 = 0.30;
+        // A *ratio*, not a percentage. This exists to catch a count left
+        // catastrophically wrong -- reset to zero by a crash mid-rollout while
+        // the data survived -- which is off by orders of magnitude. It is not
+        // here to police estimator noise, which on a bulk-loaded index runs to
+        // tens of percent and drifts as compaction proceeds.
+        const RATIO_THRESHOLD: f64 = 4.0;
         const ABS_THRESHOLD: u64 = 1000; // ...and at least this many keys
 
         let Some(database) = self.database.as_ref() else {
@@ -234,8 +239,8 @@ impl RocksDbIndex {
         let expected = cached.saturating_mul(2).saturating_add(2);
         let diff = estimate.abs_diff(expected);
 
-        let diverged =
-            diff > ABS_THRESHOLD && (diff as f64) > REL_THRESHOLD * (estimate.max(1) as f64);
+        let ratio = expected.max(estimate) as f64 / expected.min(estimate).max(1) as f64;
+        let diverged = diff > ABS_THRESHOLD && ratio > RATIO_THRESHOLD;
 
         if diverged {
             warn!(
