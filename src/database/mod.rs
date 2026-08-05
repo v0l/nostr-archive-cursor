@@ -119,6 +119,14 @@ pub struct JsonFilesDatabase<D> {
     /// Salvage damaged shards encountered while indexing (see
     /// [`with_auto_repair`](JsonFilesDatabase::with_auto_repair)).
     auto_repair: bool,
+    /// Whether a rebuild may rewrite shards that are merely *coarser* than the
+    /// current frame target.
+    ///
+    /// Shards with no usable frame boundaries are always reframed -- they are
+    /// not seekable otherwise. This only controls the optimisation case, which
+    /// costs a full decode and re-encode per shard and recurs on every rebuild.
+    /// Off by default.
+    reframe: bool,
     /// Files read concurrently by [`rebuild_index`](JsonFilesDatabase::rebuild_index).
     ///
     /// `None` means "every core". Each concurrent reader holds its own decode
@@ -521,8 +529,23 @@ where
             in_flight,
             scan_fallback: ScanFallback::default(),
             auto_repair: true,
+            reframe: false,
             rebuild_parallelism: None,
         })
+    }
+
+    /// Allow [`rebuild_index`](Self::rebuild_index) to rewrite coarsely-framed
+    /// shards. Off by default.
+    ///
+    /// Reframing only changes how much a point lookup must decompress, but it
+    /// rewrites each shard whole: a full decode, a full re-encode and a
+    /// full-size temporary copy. On a 149 GB shard that is over an hour per
+    /// rebuild, and it repeats on every run because a shard is measured against
+    /// the current frame target rather than the one it was written with.
+    /// Enable it deliberately, not as part of routine index maintenance.
+    pub fn with_reframe(mut self, on: bool) -> Self {
+        self.reframe = on;
+        self
     }
 
     /// Cap how many shards [`rebuild_index`](Self::rebuild_index) decompresses
@@ -974,14 +997,27 @@ where
 
         let table = self.pool.frame_table(path);
         let compressed_len = std::fs::metadata(path)?.len();
-        let coarse = match table.max_frame_span() {
+        let (coarse, unseekable) = match table.max_frame_span() {
             // Frames much bigger than the target: a lookup would decode far
             // more than it needs.
-            Some(max) => max > self.frame_target.saturating_mul(4),
+            Some(max) => (max > self.frame_target.saturating_mul(4), false),
             // Zero or one boundary: a single frame covering the whole file.
             // Tiny files are cheap to decode whole, so leave them.
-            None => compressed_len > self.frame_target,
+            None => (compressed_len > self.frame_target, true),
         };
+        // An archive with no usable boundaries has to be reframed or every
+        // lookup into it decompresses from byte zero -- it is not seekable at
+        // all, so this is not an optimisation and happens regardless.
+        //
+        // A shard that is merely framed more coarsely than the current target
+        // *is* only an optimisation: it already seeks, just to a bigger frame
+        // than we would pick today. Rewriting it costs a full decode and
+        // re-encode of the whole shard, and because the test is against the
+        // current target rather than the one it was written with, it recurs on
+        // every rebuild. On a 149 GB shard that is an hour a run, forever.
+        if !unseekable && !self.reframe {
+            return Ok(false);
+        }
         // Reframing writes a full-size copy beside the shard before renaming,
         // so on a nearly-full volume it can fill the disk. Coarse frames only
         // make lookups decode more than they need; a full disk loses data.
@@ -1259,6 +1295,13 @@ where
             .into_iter()
             .filter(|p| crate::cursor::is_walkable_archive(p))
             .collect();
+        if !self.reframe {
+            info!(
+                "checking {} shard(s) for unseekable frames (reframing of merely \
+                 coarse shards is off; enable with with_reframe(true))",
+                coarse.len()
+            );
+        }
         // Deliberately serial, unlike the read-only scans above. Reframing
         // rewrites a shard whole, so N of them at once need N shards' worth of
         // free space simultaneously -- on a volume with one 149 GB shard and
