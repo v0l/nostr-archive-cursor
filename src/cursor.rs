@@ -942,6 +942,40 @@ impl NostrCursor {
         segments
     }
 
+    /// Advance a freshly-seeked reader past the partial line it starts in,
+    /// returning it with the decompressed offset it now sits at.
+    ///
+    /// A no-op for a segment that starts at byte zero, which is already on a
+    /// line boundary by definition.
+    fn skip_partial_line(
+        mut reader: Box<dyn std::io::BufRead + Send>,
+        seg: &Segment,
+    ) -> std::io::Result<(Box<dyn std::io::BufRead + Send>, u64)> {
+        if seg.seek_to == 0 {
+            return Ok((reader, seg.decode_from));
+        }
+        let mut skipped = 0u64;
+        loop {
+            let buf = reader.fill_buf()?;
+            if buf.is_empty() {
+                break; // no newline in the rest of the file
+            }
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    reader.consume(i + 1);
+                    skipped += i as u64 + 1;
+                    break;
+                }
+                None => {
+                    let n = buf.len();
+                    reader.consume(n);
+                    skipped += n as u64;
+                }
+            }
+        }
+        Ok((reader, seg.decode_from + skipped))
+    }
+
     /// Open an archive positioned at a compressed byte offset.
     fn open_segment_sync(
         path: &PathBuf,
@@ -1019,8 +1053,20 @@ impl NostrCursor {
             }
         };
 
-        let mut reader =
-            crate::reader::sync::SyncChunkedJsonReader::with_base(reader, seg.decode_from);
+        // A frame boundary is not a line boundary. The writer rolls frames
+        // after a complete event, but `write_framed` -- which produced every
+        // reframed archive -- cuts on byte count, so a segment usually starts
+        // in the middle of an event. Discard that partial line here: the JSON
+        // reader treats a fragment as a hard error rather than resynchronising,
+        // which ended the segment at its first byte.
+        let (reader, base) = match Self::skip_partial_line(reader, seg) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!("{}: seeking to a line boundary: {e}", path.display());
+                return;
+            }
+        };
+        let mut reader = crate::reader::sync::SyncChunkedJsonReader::with_base(reader, base);
         let mut objects = 0u64;
         let mut events = 0u64;
         // Set once this segment has read past the range it owns.
@@ -1257,6 +1303,54 @@ mod segment_tests {
                 "{workers} segments changed the event count"
             );
             assert_eq!(got, whole, "{workers} segments changed events or offsets");
+        }
+    }
+
+    /// The same, for an archive whose frames were cut on byte counts.
+    ///
+    /// `CompressedJsonLFile` rolls a frame only after a complete event, so its
+    /// frames happen to land on line boundaries and a segment starting at one
+    /// parses cleanly by luck. `write_framed` -- which produced every reframed
+    /// archive, including the 149 GB shard this feature exists for -- cuts on
+    /// byte count, so segments start mid-event. The JSON reader treats a
+    /// fragment as a hard error rather than resynchronising, which ended each
+    /// segment at its first byte and silently dropped the rest of its range.
+    #[test]
+    fn segments_of_a_byte_framed_archive_read_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = write_archive(dir.path(), 20_000, 1 << 20);
+        let whole = walk(dir.path(), 1);
+        assert_eq!(whole.len(), 20_000);
+
+        // Reframe it the way an imported archive gets reframed: frames cut by
+        // size, with no regard for where events begin or end.
+        crate::database::file::reframe_archive(&src, 4096).unwrap();
+
+        let after = walk(dir.path(), 1);
+        assert_eq!(after.len(), 20_000, "reframe must preserve every event");
+
+        for workers in [2usize, 4, 8] {
+            let segs = NostrCursor::plan_segments_for_test(&src, workers, 0);
+            assert!(segs.len() > 1, "expected a split at {workers} workers");
+
+            let seen: Arc<Mutex<Vec<(String, u64, u32)>>> = Arc::new(Mutex::new(Vec::new()));
+            for seg in &segs {
+                let out = seen.clone();
+                NostrCursor::read_segment_sync_chunked(
+                    seg,
+                    &move |_p: &std::path::Path, events: Vec<LocatedEvent<'_>>| {
+                        let mut g = out.lock().unwrap();
+                        for e in events {
+                            g.push((e.event.id.to_string(), e.offset, e.len));
+                        }
+                    },
+                    None,
+                    64,
+                );
+            }
+            let mut got = Arc::try_unwrap(seen).unwrap().into_inner().unwrap();
+            got.sort();
+            assert_eq!(got, after, "{workers} segments lost or duplicated events");
         }
     }
 
