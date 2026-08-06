@@ -724,8 +724,11 @@ where
     /// `(shard, frame)` so a frame holding several wanted events is decoded
     /// once, executed in parallel on the blocking pool.
     pub async fn get_many_raw(&self, ids: &[EventId]) -> Vec<Option<Vec<u8>>> {
+        let t_all = std::time::Instant::now();
         let keys: Vec<[u8; 32]> = ids.iter().map(|i| *i.as_bytes()).collect();
+        let t_idx = std::time::Instant::now();
         let entries = self.database.get_many(&keys);
+        let index_ms = t_idx.elapsed().as_millis();
 
         let mut requests = Vec::with_capacity(ids.len());
         // request index -> position in the output
@@ -754,12 +757,17 @@ where
         }
 
         let mut out = vec![None; ids.len()];
+        let n_req = requests.len();
+        let n_fallback = fallback.len();
+        let t_read = std::time::Instant::now();
         if !requests.is_empty() {
             let read = self.pool.read_many_async(Arc::new(requests)).await;
             for (slot, bytes) in slots.into_iter().zip(read) {
                 out[slot] = bytes;
             }
         }
+        let read_ms = t_read.elapsed().as_millis();
+        let t_scan = std::time::Instant::now();
 
         // Events whose location is unknown: scan the shard for the day we do
         // know about. Bounded, and it keeps pre-existing (v0) databases usable
@@ -772,6 +780,27 @@ where
                 out[i] = self.scan_for_id(&ids[i], ts).await;
             }
         }
+
+        let scan_ms = t_scan.elapsed().as_millis();
+
+        // Which half of hydration is expensive, and whether the fast path is
+        // even being taken.
+        //
+        // `requests` are direct offset reads; `fallback` are entries with no
+        // usable location, each of which scans a shard. A request whose cost
+        // is flat in the number of ids is waiting on the read pool, not doing
+        // per-event work -- these fields are what tells the two apart.
+        tracing::info!(
+            ids = ids.len(),
+            index_ms,
+            read_ms,
+            scan_ms,
+            total_ms = t_all.elapsed().as_millis(),
+            direct = n_req,
+            fallback = n_fallback,
+            pool_concurrency = self.pool.concurrency(),
+            "archive hydrate"
+        );
 
         // A stale or corrupt offset must never yield the wrong event.
         for (i, bytes) in out.iter_mut().enumerate() {

@@ -113,6 +113,15 @@ impl ShardReaderPool {
     }
 
     /// Number of worker threads used for batch reads (default: CPU count).
+    /// Reader threads this pool will use for one batch.
+    ///
+    /// Exposed so a caller can report it alongside read timings: a hydration
+    /// whose cost is flat in the number of events is queueing, and the queue
+    /// depth is only interpretable next to this number.
+    pub fn concurrency(&self) -> usize {
+        self.concurrency
+    }
+
     pub fn with_concurrency(mut self, concurrency: usize) -> Self {
         self.concurrency = concurrency.max(1);
         self
