@@ -790,16 +790,17 @@ where
         // usable location, each of which scans a shard. A request whose cost
         // is flat in the number of ids is waiting on the read pool, not doing
         // per-event work -- these fields are what tells the two apart.
-        tracing::info!(
-            ids = ids.len(),
+        info!(
+            "archive hydrate: ids={} index_ms={} read_ms={} scan_ms={} total_ms={} \
+             direct={} fallback={} pool_concurrency={}",
+            ids.len(),
             index_ms,
             read_ms,
             scan_ms,
-            total_ms = t_all.elapsed().as_millis(),
-            direct = n_req,
-            fallback = n_fallback,
-            pool_concurrency = self.pool.concurrency(),
-            "archive hydrate"
+            t_all.elapsed().as_millis(),
+            n_req,
+            n_fallback,
+            self.pool.concurrency()
         );
 
         // A stale or corrupt offset must never yield the wrong event.
